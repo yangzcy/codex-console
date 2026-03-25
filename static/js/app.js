@@ -39,6 +39,121 @@ let batchWsHeartbeatInterval = null;  // 批量任务心跳定时器
 let activeTaskUuid = null;   // 当前活跃的单任务 UUID（用于页面重新可见时重连）
 let activeBatchId = null;    // 当前活跃的批量任务 ID（用于页面重新可见时重连）
 
+function getBatchTaskLabel() {
+    return isOutlookBatchMode ? 'Outlook 批量任务' : '批量任务';
+}
+
+function getCurrentSingleServiceLabel() {
+    if (currentTask?.email_service_name) {
+        return currentTask.email_service_name;
+    }
+
+    const label = getSelectedServiceLabel();
+    if (label) {
+        return label;
+    }
+
+    if (currentTask?.email_service) {
+        return getServiceTypeText(currentTask.email_service);
+    }
+
+    return '-';
+}
+
+function getSingleCompletionMessage(status) {
+    const serviceLabel = getCurrentSingleServiceLabel();
+    if (status === 'completed') {
+        return `[成功] 注册成功！邮箱服务: ${serviceLabel}`;
+    }
+    if (status === 'failed') {
+        return `[错误] 注册失败，邮箱服务: ${serviceLabel}`;
+    }
+    return `[警告] 任务已取消，邮箱服务: ${serviceLabel}`;
+}
+
+function getCurrentBatchServiceLabel() {
+    if (currentBatch?.email_service_name) {
+        return currentBatch.email_service_name;
+    }
+
+    if (isOutlookBatchMode) {
+        return 'Outlook';
+    }
+
+    const label = getSelectedServiceLabel();
+    if (label) {
+        return label;
+    }
+
+    if (currentBatch?.email_service) {
+        return getServiceTypeText(currentBatch.email_service);
+    }
+
+    return '-';
+}
+
+function getBatchCompletionMessage(data) {
+    return `[完成] ${getBatchTaskLabel()}完成！邮箱服务: ${getCurrentBatchServiceLabel()}，成功: ${data.success}, 失败: ${data.failed}, 跳过: ${data.skipped || 0}`;
+}
+
+function getBatchSuccessToastText(successCount) {
+    return isOutlookBatchMode
+        ? `Outlook 批量注册完成，成功 ${successCount} 个`
+        : `${getCurrentBatchServiceLabel()} 批量注册完成，成功 ${successCount} 个`;
+}
+
+function getBatchEmptyToastText() {
+    return isOutlookBatchMode
+        ? 'Outlook 批量注册完成，但没有成功注册任何账号'
+        : `${getCurrentBatchServiceLabel()} 批量任务完成，但没有成功注册任何账号`;
+}
+
+function getSelectedServiceLabel() {
+    const select = elements.emailService;
+    if (!select) {
+        return '';
+    }
+
+    const option = select.options[select.selectedIndex];
+    return option ? option.textContent.trim() : '';
+}
+
+function inferCurrentEmailServiceType(task = null) {
+    if (task?.email_service_name) {
+        return task.email_service_name;
+    }
+
+    if (task?.email_service) {
+        return task.email_service;
+    }
+
+    if (task?.result?.metadata?.email_service) {
+        return task.result.metadata.email_service;
+    }
+
+    if (task?.result?.email_service) {
+        return task.result.email_service;
+    }
+
+    const selected = elements.emailService?.value || '';
+    if (!selected) {
+        return isOutlookBatchMode ? 'outlook' : '';
+    }
+
+    const [type] = selected.split(':');
+    if (type === 'outlook_batch') {
+        return 'outlook';
+    }
+    return getSelectedServiceLabel() || type;
+}
+
+function updateTaskServiceLabel(task = null) {
+    const serviceType = inferCurrentEmailServiceType(task);
+    elements.taskService.textContent = serviceType
+        ? (task?.email_service_name || getServiceTypeText(serviceType))
+        : '-';
+}
+
 // DOM 元素
 const elements = {
     form: document.getElementById('registration-form'),
@@ -541,12 +656,17 @@ async function handleSingleRegistration(requestData) {
     try {
         const data = await api.post('/registration/start', requestData);
 
-        currentTask = data;
+        currentTask = {
+            ...data,
+            email_service: requestData.email_service_type,
+            email_service_name: getSelectedServiceLabel() || getServiceTypeText(requestData.email_service_type)
+        };
         activeTaskUuid = data.task_uuid;  // 保存用于重连
         // 持久化到 sessionStorage，跨页面导航后可恢复
         sessionStorage.setItem('activeTask', JSON.stringify({ task_uuid: data.task_uuid, mode: 'single' }));
         addLog('info', `[系统] 任务已创建: ${data.task_uuid}`);
-        showTaskStatus(data);
+        addLog('info', `[系统] 所选邮箱服务: ${currentTask.email_service_name}`);
+        showTaskStatus(currentTask);
         updateTaskStatus('running');
 
         // 优先使用 WebSocket
@@ -556,6 +676,28 @@ async function handleSingleRegistration(requestData) {
         addLog('error', `[错误] 启动失败: ${error.message}`);
         toast.error(error.message);
         resetButtons();
+    }
+}
+
+async function refreshTaskSummary(taskUuid) {
+    if (!taskUuid) {
+        return;
+    }
+
+    try {
+        const data = await api.get(`/registration/tasks/${taskUuid}`);
+        currentTask = {
+            ...(currentTask || {}),
+            ...data,
+            email_service: data?.email_service || currentTask?.email_service,
+            email_service_name: data?.email_service_name || currentTask?.email_service_name
+        };
+        if (data?.email) {
+            elements.taskEmail.textContent = data.email;
+        }
+        updateTaskServiceLabel(currentTask);
+    } catch (error) {
+        console.error('刷新任务摘要失败:', error);
     }
 }
 
@@ -599,6 +741,7 @@ function connectWebSocket(taskUuid) {
                     // 保存最终状态，用于 onclose 判断
                     taskFinalStatus = data.status;
                     taskCompleted = true;
+                    refreshTaskSummary(currentTask?.task_uuid || taskUuid);
 
                     // 断开 WebSocket（异步操作）
                     disconnectWebSocket();
@@ -610,15 +753,15 @@ function connectWebSocket(taskUuid) {
                     if (!toastShown) {
                         toastShown = true;
                         if (data.status === 'completed') {
-                            addLog('success', '[成功] 注册成功！');
-                            toast.success('注册成功！');
+                            addLog('success', getSingleCompletionMessage('completed'));
+                            toast.success(`注册成功！邮箱服务: ${getCurrentSingleServiceLabel()}`);
                             // 刷新账号列表
                             loadRecentAccounts();
                         } else if (data.status === 'failed') {
-                            addLog('error', '[错误] 注册失败');
-                            toast.error('注册失败');
+                            addLog('error', getSingleCompletionMessage('failed'));
+                            toast.error(`注册失败，邮箱服务: ${getCurrentSingleServiceLabel()}`);
                         } else if (data.status === 'cancelled' || data.status === 'cancelling') {
-                            addLog('warning', '[警告] 任务已取消');
+                            addLog('warning', getSingleCompletionMessage('cancelled'));
                         }
                     }
                 }
@@ -717,11 +860,16 @@ async function handleBatchRegistration(requestData) {
     try {
         const data = await api.post('/registration/batch', requestData);
 
-        currentBatch = data;
+        currentBatch = {
+            ...data,
+            email_service: requestData.email_service_type,
+            email_service_name: getSelectedServiceLabel() || getServiceTypeText(requestData.email_service_type)
+        };
         activeBatchId = data.batch_id;  // 保存用于重连
         // 持久化到 sessionStorage，跨页面导航后可恢复
         sessionStorage.setItem('activeTask', JSON.stringify({ batch_id: data.batch_id, mode: 'batch', total: data.count }));
         addLog('info', `[系统] 批量任务已创建: ${data.batch_id}`);
+        addLog('info', `[系统] 所选邮箱服务: ${currentBatch.email_service_name}`);
         addLog('info', `[系统] 共 ${data.count} 个任务已加入队列`);
         showBatchStatus(data);
 
@@ -807,9 +955,7 @@ function startLogPolling(taskUuid) {
             if (data.email) {
                 elements.taskEmail.textContent = data.email;
             }
-            if (data.email_service) {
-                elements.taskService.textContent = getServiceTypeText(data.email_service);
-            }
+            updateTaskServiceLabel(data);
 
             // 添加新日志
             const logs = data.logs || [];
@@ -823,21 +969,22 @@ function startLogPolling(taskUuid) {
             // 检查任务是否完成
             if (['completed', 'failed', 'cancelled'].includes(data.status)) {
                 stopLogPolling();
+                refreshTaskSummary(taskUuid);
                 resetButtons();
 
                 // 只显示一次 toast
                 if (!toastShown) {
                     toastShown = true;
                     if (data.status === 'completed') {
-                        addLog('success', '[成功] 注册成功！');
-                        toast.success('注册成功！');
+                        addLog('success', getSingleCompletionMessage('completed'));
+                        toast.success(`注册成功！邮箱服务: ${getCurrentSingleServiceLabel()}`);
                         // 刷新账号列表
                         loadRecentAccounts();
                     } else if (data.status === 'failed') {
-                        addLog('error', '[错误] 注册失败');
-                        toast.error('注册失败');
+                        addLog('error', getSingleCompletionMessage('failed'));
+                        toast.error(`注册失败，邮箱服务: ${getCurrentSingleServiceLabel()}`);
                     } else if (data.status === 'cancelled') {
-                        addLog('warning', '[警告] 任务已取消');
+                        addLog('warning', getSingleCompletionMessage('cancelled'));
                     }
                 }
             }
@@ -870,7 +1017,7 @@ function startBatchPolling(batchId) {
                 // 只显示一次 toast
                 if (!toastShown) {
                     toastShown = true;
-                    addLog('info', `[完成] 批量任务完成！成功: ${data.success}, 失败: ${data.failed}`);
+                    addLog('info', getBatchCompletionMessage(data));
                     if (data.success > 0) {
                         toast.success(`批量注册完成，成功 ${data.success} 个`);
                         // 刷新账号列表
@@ -900,8 +1047,8 @@ function showTaskStatus(task) {
     elements.batchProgressSection.style.display = 'none';
     elements.taskStatusBadge.style.display = 'inline-flex';
     elements.taskId.textContent = task.task_uuid.substring(0, 8) + '...';
-    elements.taskEmail.textContent = '-';
-    elements.taskService.textContent = '-';
+    elements.taskEmail.textContent = task?.email || '-';
+    updateTaskServiceLabel(task);
 }
 
 // 更新任务状态
@@ -1322,7 +1469,12 @@ async function handleOutlookBatchRegistration() {
             return;
         }
 
-        currentBatch = { batch_id: data.batch_id, ...data };
+        currentBatch = {
+            batch_id: data.batch_id,
+            ...data,
+            email_service: 'outlook',
+            email_service_name: 'Outlook'
+        };
         activeBatchId = data.batch_id;  // 保存用于重连
         // 持久化到 sessionStorage，跨页面导航后可恢复
         sessionStorage.setItem('activeTask', JSON.stringify({ batch_id: data.batch_id, mode: isOutlookBatchMode ? 'outlook_batch' : 'batch', total: data.to_register }));
@@ -1393,12 +1545,12 @@ function connectBatchWebSocket(batchId) {
                     if (!toastShown) {
                         toastShown = true;
                         if (data.status === 'completed') {
-                            addLog('success', `[完成] Outlook 批量任务完成！成功: ${data.success}, 失败: ${data.failed}, 跳过: ${data.skipped || 0}`);
+                            addLog('success', getBatchCompletionMessage(data));
                             if (data.success > 0) {
-                                toast.success(`Outlook 批量注册完成，成功 ${data.success} 个`);
+                                toast.success(getBatchSuccessToastText(data.success));
                                 loadRecentAccounts();
                             } else {
-                                toast.warning('Outlook 批量注册完成，但没有成功注册任何账号');
+                                toast.warning(getBatchEmptyToastText());
                             }
                         } else if (data.status === 'failed') {
                             addLog('error', '[错误] 批量任务执行失败');
@@ -1508,12 +1660,12 @@ function startOutlookBatchPolling(batchId) {
                 // 只显示一次 toast
                 if (!toastShown) {
                     toastShown = true;
-                    addLog('info', `[完成] Outlook 批量任务完成！成功: ${data.success}, 失败: ${data.failed}, 跳过: ${data.skipped || 0}`);
+                    addLog('info', getBatchCompletionMessage(data));
                     if (data.success > 0) {
-                        toast.success(`Outlook 批量注册完成，成功 ${data.success} 个`);
+                        toast.success(getBatchSuccessToastText(data.success));
                         loadRecentAccounts();
                     } else {
-                        toast.warning('Outlook 批量注册完成，但没有成功注册任何账号');
+                        toast.warning(getBatchEmptyToastText());
                     }
                 }
             }

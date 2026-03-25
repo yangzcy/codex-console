@@ -8,13 +8,79 @@ import time
 import logging
 import random
 import string
+from datetime import datetime
 from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse
 
 from .base import BaseEmailService, EmailServiceError, EmailServiceType
 from ..core.http_client import HTTPClient, RequestConfig
 from ..config.constants import OTP_CODE_PATTERN
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_domain(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    if "://" in text:
+        parsed = urlparse(text)
+        candidate = parsed.hostname or parsed.netloc or parsed.path
+        text = candidate or text
+
+    return text.strip().lstrip("@").rstrip("/").lower()
+
+
+def _normalize_domain_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        domains = [_normalize_domain(item) for item in value]
+    else:
+        text = str(value or "").strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                import json
+
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    domains = [_normalize_domain(item) for item in parsed]
+                else:
+                    domains = [_normalize_domain(text)]
+            except Exception:
+                domains = [_normalize_domain(item) for item in text.split(",")]
+        elif "," in text:
+            domains = [_normalize_domain(item) for item in text.split(",")]
+        else:
+            domains = [_normalize_domain(text)]
+
+    result: List[str] = []
+    for domain in domains:
+        if domain and domain not in result:
+            result.append(domain)
+    return result
+
+
+def _to_timestamp(value: Any) -> Optional[float]:
+    """将 Freemail 返回的时间字段转换为 Unix 时间戳。"""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        try:
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            return datetime.fromisoformat(text).timestamp()
+        except ValueError:
+            return None
+    return None
 
 
 class FreemailService(BaseEmailService):
@@ -49,6 +115,7 @@ class FreemailService(BaseEmailService):
         }
         self.config = {**default_config, **(config or {})}
         self.config["base_url"] = self.config["base_url"].rstrip("/")
+        self.config["domain"] = _normalize_domain_list(self.config.get("domain"))
 
         http_config = RequestConfig(
             timeout=self.config["timeout"],
@@ -116,9 +183,29 @@ class FreemailService(BaseEmailService):
             try:
                 domains = self._make_request("GET", "/api/domains")
                 if isinstance(domains, list):
-                    self._domains = domains
+                    self._domains = _normalize_domain_list(domains)
             except Exception as e:
                 logger.warning(f"获取 Freemail 域名列表失败: {e}")
+
+    def _resolve_domain_index(self, requested_domain: Any = None) -> int:
+        self._ensure_domains()
+
+        if not self._domains:
+            return 0
+
+        configured_domains = _normalize_domain_list(
+            requested_domain if requested_domain not in (None, "") else self.config.get("domain")
+        )
+
+        if not configured_domains:
+            return random.randrange(len(self._domains))
+
+        matched = [domain for domain in self._domains if domain in configured_domains]
+        if not matched:
+            matched = self._domains
+
+        target_domain = random.choice(matched)
+        return self._domains.index(target_domain)
 
     def create_email(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
         """
@@ -129,17 +216,8 @@ class FreemailService(BaseEmailService):
             - email: 邮箱地址
             - service_id: 同 email（用作标识）
         """
-        self._ensure_domains()
-        
         req_config = config or {}
-        domain_index = 0
-        target_domain = req_config.get("domain") or self.config.get("domain")
-        
-        if target_domain and self._domains:
-            for i, d in enumerate(self._domains):
-                if d == target_domain:
-                    domain_index = i
-                    break
+        domain_index = self._resolve_domain_index(req_config.get("domain"))
                     
         prefix = req_config.get("name")
         try:
@@ -184,6 +262,7 @@ class FreemailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        poll_interval: int = 3,
     ) -> Optional[str]:
         """
         从 Freemail 邮箱获取验证码
@@ -193,7 +272,8 @@ class FreemailService(BaseEmailService):
             email_id: 未使用，保留接口兼容
             timeout: 超时时间（秒）
             pattern: 验证码正则
-            otp_sent_at: OTP 发送时间戳（暂未使用）
+            otp_sent_at: OTP 发送时间戳，用于过滤旧邮件
+            poll_interval: 轮询间隔（秒）
 
         Returns:
             验证码字符串，超时返回 None
@@ -207,12 +287,25 @@ class FreemailService(BaseEmailService):
             try:
                 mails = self._make_request("GET", "/api/emails", params={"mailbox": email, "limit": 20})
                 if not isinstance(mails, list):
-                    time.sleep(3)
+                    time.sleep(poll_interval)
                     continue
 
                 for mail in mails:
                     mail_id = mail.get("id")
                     if not mail_id or mail_id in seen_mail_ids:
+                        continue
+
+                    created_at = (
+                        _to_timestamp(mail.get("created_at"))
+                        or _to_timestamp(mail.get("received_at"))
+                        or _to_timestamp(mail.get("date"))
+                        or _to_timestamp(mail.get("timestamp"))
+                    )
+
+                    # 新注册后会立刻进入“重新登录拿 token”流程。
+                    # 如果不按 OTP 发送时间过滤，容易再次取到注册阶段的旧验证码，导致 401。
+                    if otp_sent_at and created_at and created_at + 1 < otp_sent_at:
+                        seen_mail_ids.add(mail_id)
                         continue
 
                     seen_mail_ids.add(mail_id)
@@ -257,7 +350,7 @@ class FreemailService(BaseEmailService):
             except Exception as e:
                 logger.debug(f"检查 Freemail 邮件时出错: {e}")
 
-            time.sleep(3)
+            time.sleep(poll_interval)
 
         logger.warning(f"等待 Freemail 验证码超时: {email}")
         return None

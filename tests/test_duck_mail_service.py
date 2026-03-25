@@ -39,6 +39,16 @@ def test_create_email_creates_account_and_fetches_token():
     })
     fake_client = FakeHTTPClient([
         FakeResponse(
+            payload={
+                "hydra:member": [
+                    {"id": "domain-1", "domain": "duckmail.sbs"},
+                ],
+                "hydra:view": {
+                    "hydra:last": "/domains?page=1",
+                },
+            }
+        ),
+        FakeResponse(
             status_code=201,
             payload={
                 "id": "account-1",
@@ -62,14 +72,20 @@ def test_create_email_creates_account_and_fetches_token():
     assert email_info["account_id"] == "account-1"
     assert email_info["token"] == "token-123"
 
-    create_call = fake_client.calls[0]
+    list_domains_call = fake_client.calls[0]
+    assert list_domains_call["method"] == "GET"
+    assert list_domains_call["url"] == "https://api.duckmail.test/domains"
+    assert list_domains_call["kwargs"]["params"] == {"page": 1}
+    assert list_domains_call["kwargs"]["headers"]["Authorization"] == "Bearer dk_test_key"
+
+    create_call = fake_client.calls[1]
     assert create_call["method"] == "POST"
     assert create_call["url"] == "https://api.duckmail.test/accounts"
     assert create_call["kwargs"]["json"]["address"].endswith("@duckmail.sbs")
     assert len(create_call["kwargs"]["json"]["password"]) == 10
     assert create_call["kwargs"]["headers"]["Authorization"] == "Bearer dk_test_key"
 
-    token_call = fake_client.calls[1]
+    token_call = fake_client.calls[2]
     assert token_call["method"] == "POST"
     assert token_call["url"] == "https://api.duckmail.test/token"
     assert token_call["kwargs"]["json"] == {
@@ -84,6 +100,16 @@ def test_get_verification_code_reads_message_detail_and_extracts_code():
         "default_domain": "duckmail.sbs",
     })
     fake_client = FakeHTTPClient([
+        FakeResponse(
+            payload={
+                "hydra:member": [
+                    {"id": "domain-1", "domain": "duckmail.sbs"},
+                ],
+                "hydra:view": {
+                    "hydra:last": "/domains?page=1",
+                },
+            }
+        ),
         FakeResponse(
             status_code=201,
             payload={
@@ -132,12 +158,109 @@ def test_get_verification_code_reads_message_detail_and_extracts_code():
 
     assert code == "654321"
 
-    messages_call = fake_client.calls[2]
+    messages_call = fake_client.calls[3]
     assert messages_call["method"] == "GET"
     assert messages_call["url"] == "https://api.duckmail.test/messages"
     assert messages_call["kwargs"]["headers"]["Authorization"] == "Bearer token-123"
 
-    detail_call = fake_client.calls[3]
+    detail_call = fake_client.calls[4]
     assert detail_call["method"] == "GET"
     assert detail_call["url"] == "https://api.duckmail.test/messages/msg-1"
     assert detail_call["kwargs"]["headers"]["Authorization"] == "Bearer token-123"
+
+
+def test_create_email_fails_when_default_domain_not_available():
+    service = DuckMailService({
+        "base_url": "https://api.duckmail.test",
+        "default_domain": "missing.example",
+    })
+    fake_client = FakeHTTPClient([
+        FakeResponse(
+            payload={
+                "hydra:member": [
+                    {"id": "domain-1", "domain": "duckmail.sbs"},
+                ],
+                "hydra:view": {
+                    "hydra:last": "/domains?page=1",
+                },
+            }
+        ),
+    ])
+    service.http_client = fake_client
+
+    try:
+        service.create_email()
+    except Exception as exc:
+        assert "DuckMail 域名不可用或未验证" in str(exc)
+    else:
+        raise AssertionError("应当因为域名不可用而失败")
+
+
+def test_check_health_requires_configured_domain_to_exist():
+    service = DuckMailService({
+        "base_url": "https://api.duckmail.test",
+        "default_domain": "private.example",
+    })
+    fake_client = FakeHTTPClient([
+        FakeResponse(
+            payload={
+                "hydra:member": [
+                    {"id": "domain-1", "domain": "duckmail.sbs"},
+                ],
+                "hydra:view": {
+                    "hydra:last": "/domains?page=1",
+                },
+            }
+        ),
+    ])
+    service.http_client = fake_client
+
+    assert service.check_health() is False
+    assert "private.example" in str(service.last_error)
+
+
+def test_init_normalizes_default_domain_from_url():
+    service = DuckMailService({
+        "base_url": "https://api.duckmail.test",
+        "default_domain": "https://mail.example.com/some/path",
+    })
+
+    assert service.config["default_domain"] == ["mail.example.com"]
+
+
+def test_create_email_accepts_multiple_default_domains():
+    service = DuckMailService({
+        "base_url": "https://api.duckmail.test",
+        "default_domain": ["missing.example", "duckmail.sbs"],
+    })
+    fake_client = FakeHTTPClient([
+        FakeResponse(
+            payload={
+                "hydra:member": [
+                    {"id": "domain-1", "domain": "duckmail.sbs"},
+                    {"id": "domain-2", "domain": "baldur.edu.kg"},
+                ],
+                "hydra:view": {
+                    "hydra:last": "/domains?page=1",
+                },
+            }
+        ),
+        FakeResponse(
+            status_code=201,
+            payload={
+                "id": "account-1",
+                "address": "tester@duckmail.sbs",
+            },
+        ),
+        FakeResponse(
+            payload={
+                "id": "account-1",
+                "token": "token-123",
+            }
+        ),
+    ])
+    service.http_client = fake_client
+
+    email_info = service.create_email()
+
+    assert email_info["email"].endswith("@duckmail.sbs")

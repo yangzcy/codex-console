@@ -603,6 +603,7 @@ class TempMailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        poll_interval: int = 3,
     ) -> Optional[str]:
         """
         从 TempMail 邮箱获取验证码
@@ -613,6 +614,7 @@ class TempMailService(BaseEmailService):
             timeout: 超时时间（秒）
             pattern: 验证码正则
             otp_sent_at: OTP 发送时间戳（用于过滤旧邮件）
+            poll_interval: 轮询间隔（秒）
 
         Returns:
             验证码字符串，超时返回 None
@@ -643,7 +645,7 @@ class TempMailService(BaseEmailService):
                         logger.info(
                             f"TempMail 轮询[{email}] 第 {poll_count} 次: 暂无邮件（已等待 {int(time.time() - start_time)}s）"
                         )
-                    time.sleep(3)
+                    time.sleep(poll_interval)
                     continue
 
                 if poll_count == 1 or poll_count % 3 == 0:
@@ -730,7 +732,7 @@ class TempMailService(BaseEmailService):
                         email,
                         unknown_ts_grace_seconds,
                     )
-                    time.sleep(3)
+                    time.sleep(poll_interval)
                     continue
 
                 all_candidates = candidates + unknown_ts_candidates
@@ -761,7 +763,7 @@ class TempMailService(BaseEmailService):
             except Exception as e:
                 logger.debug(f"检查 TempMail 邮件时出错: {e}")
 
-            time.sleep(3)
+            time.sleep(poll_interval)
 
         logger.warning(f"等待 TempMail 验证码超时: {email}")
         return None

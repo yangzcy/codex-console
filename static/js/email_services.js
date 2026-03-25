@@ -307,11 +307,36 @@ function getCustomServiceAddress(service) {
         return `${escapeHtml(host)}<div style="color: var(--text-muted); margin-top: 4px;">${escapeHtml(emailAddr)}</div>`;
     }
     const baseUrl = service.config?.base_url || '-';
-    const domain = service.config?.default_domain || service.config?.domain;
+    const rawDomain = service.config?.default_domain || service.config?.domain;
+    const domainValue = Array.isArray(rawDomain) ? rawDomain : parseDomainList(rawDomain);
+    const domain = Array.isArray(domainValue) ? domainValue.join(', ') : domainValue;
     if (!domain) {
         return escapeHtml(baseUrl);
     }
+    if (Array.isArray(domainValue)) {
+        return `${escapeHtml(baseUrl)}<div style="color: var(--text-muted); margin-top: 4px;">已解析 ${domainValue.length} 个域名：${escapeHtml(domain)}</div>`;
+    }
     return `${escapeHtml(baseUrl)}<div style="color: var(--text-muted); margin-top: 4px;">默认域名：@${escapeHtml(domain)}</div>`;
+}
+
+function parseDomainList(value) {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    let items = [];
+    if (text.startsWith('[') && text.endsWith(']')) {
+        try {
+            const parsed = JSON.parse(text);
+            if (Array.isArray(parsed)) {
+                items = parsed.map(item => String(item || '').trim()).filter(Boolean);
+            }
+        } catch (_) {
+            items = [];
+        }
+    }
+    if (!items.length) {
+        items = text.split(',').map(item => item.trim()).filter(Boolean);
+    }
+    return items.length <= 1 ? (items[0] || '') : items;
 }
 
 // 加载自定义邮箱服务（moe_mail + temp_mail + duck_mail + freemail 合并）
@@ -442,74 +467,77 @@ async function handleOutlookImport() {
 // 添加自定义邮箱服务（根据子类型区分）
 async function handleAddCustom(e) {
     e.preventDefault();
-    const formData = new FormData(e.target);
-    const subType = formData.get('sub_type');
-
-    let serviceType, config;
-    if (subType === 'moemail') {
-        serviceType = 'moe_mail';
-        config = {
-            base_url: formData.get('api_url'),
-            api_key: formData.get('api_key'),
-            default_domain: formData.get('domain')
-        };
-    } else if (subType === 'tempmail') {
-        serviceType = 'temp_mail';
-        config = {
-            base_url: formData.get('tm_base_url'),
-            admin_password: formData.get('tm_admin_password'),
-            domain: formData.get('tm_domain'),
-            enable_prefix: true
-        };
-    } else if (subType === 'duckmail') {
-        serviceType = 'duck_mail';
-        config = {
-            base_url: formData.get('dm_base_url'),
-            api_key: formData.get('dm_api_key'),
-            default_domain: formData.get('dm_domain'),
-            password_length: parseInt(formData.get('dm_password_length'), 10) || 12
-        };
-    } else if (subType === 'freemail') {
-        serviceType = 'freemail';
-        config = {
-            base_url: formData.get('fm_base_url'),
-            admin_token: formData.get('fm_admin_token'),
-            domain: formData.get('fm_domain')
-        };
-    } else if (subType === 'cloudmail') {
-        serviceType = 'cloud_mail';
-        const domainInput = formData.get('cm_domain');
-        // 处理域名：如果包含逗号，转换为数组；否则保持字符串
-        let domain = domainInput;
-        if (domainInput && domainInput.includes(',')) {
-            domain = domainInput.split(',').map(d => d.trim()).filter(d => d);
-        }
-        config = {
-            base_url: formData.get('cm_base_url'),
-            admin_email: formData.get('cm_admin_email'),
-            admin_password: formData.get('cm_admin_password'),
-            domain: domain
-        };
-    } else {
-        serviceType = 'imap_mail';
-        config = {
-            host: formData.get('imap_host'),
-            port: parseInt(formData.get('imap_port'), 10) || 993,
-            use_ssl: formData.get('imap_use_ssl') !== 'false',
-            email: formData.get('imap_email'),
-            password: formData.get('imap_password')
-        };
-    }
-
-    const data = {
-        service_type: serviceType,
-        name: formData.get('name'),
-        config,
-        enabled: formData.get('enabled') === 'on',
-        priority: parseInt(formData.get('priority')) || 0
-    };
-
     try {
+        const formData = new FormData(e.target);
+        const subType = formData.get('sub_type');
+
+        if (!subType) {
+            throw new Error('未识别到服务类型，请重新打开弹窗后再试');
+        }
+
+        let serviceType, config;
+        if (subType === 'moemail') {
+            serviceType = 'moe_mail';
+            config = {
+                base_url: formData.get('api_url'),
+                api_key: formData.get('api_key'),
+                default_domain: formData.get('domain')
+            };
+        } else if (subType === 'tempmail') {
+            serviceType = 'temp_mail';
+            config = {
+                base_url: formData.get('tm_base_url'),
+                admin_password: formData.get('tm_admin_password'),
+                domain: formData.get('tm_domain'),
+                enable_prefix: true
+            };
+        } else if (subType === 'duckmail') {
+            serviceType = 'duck_mail';
+            config = {
+                base_url: formData.get('dm_base_url'),
+                api_key: formData.get('dm_api_key'),
+                default_domain: parseDomainList(formData.get('dm_domain')),
+                password_length: parseInt(formData.get('dm_password_length'), 10) || 12
+            };
+        } else if (subType === 'freemail') {
+            serviceType = 'freemail';
+            config = {
+                base_url: formData.get('fm_base_url'),
+                admin_token: formData.get('fm_admin_token'),
+                domain: parseDomainList(formData.get('fm_domain'))
+            };
+        } else if (subType === 'cloudmail') {
+            serviceType = 'cloud_mail';
+            const domainInput = formData.get('cm_domain');
+            let domain = domainInput;
+            if (domainInput && domainInput.includes(',')) {
+                domain = domainInput.split(',').map(d => d.trim()).filter(d => d);
+            }
+            config = {
+                base_url: formData.get('cm_base_url'),
+                admin_email: formData.get('cm_admin_email'),
+                admin_password: formData.get('cm_admin_password'),
+                domain: domain
+            };
+        } else {
+            serviceType = 'imap_mail';
+            config = {
+                host: formData.get('imap_host'),
+                port: parseInt(formData.get('imap_port'), 10) || 993,
+                use_ssl: formData.get('imap_use_ssl') !== 'false',
+                email: formData.get('imap_email'),
+                password: formData.get('imap_password')
+            };
+        }
+
+        const data = {
+            service_type: serviceType,
+            name: formData.get('name'),
+            config,
+            enabled: formData.get('enabled') === 'on',
+            priority: parseInt(formData.get('priority')) || 0
+        };
+
         await api.post('/email-services', data);
         toast.success('服务添加成功');
         elements.addCustomModal.classList.remove('active');
@@ -517,6 +545,7 @@ async function handleAddCustom(e) {
         loadCustomServices();
         loadStats();
     } catch (error) {
+        console.error('添加邮箱服务失败:', error);
         toast.error('添加失败: ' + error.message);
     }
 }
@@ -669,13 +698,15 @@ async function editCustomService(id, subType) {
             document.getElementById('edit-dm-base-url').value = service.config?.base_url || '';
             document.getElementById('edit-dm-api-key').value = '';
             document.getElementById('edit-dm-api-key').placeholder = service.config?.api_key ? '已设置，留空保持不变' : '请输入 API Key（可选）';
-            document.getElementById('edit-dm-domain').value = service.config?.default_domain || '';
+            const duckDomains = service.config?.default_domain;
+            document.getElementById('edit-dm-domain').value = Array.isArray(duckDomains) ? duckDomains.join(', ') : (duckDomains || '');
             document.getElementById('edit-dm-password-length').value = service.config?.password_length || 12;
         } else if (resolvedSubType === 'freemail') {
             document.getElementById('edit-fm-base-url').value = service.config?.base_url || '';
             document.getElementById('edit-fm-admin-token').value = '';
             document.getElementById('edit-fm-admin-token').placeholder = service.config?.admin_token ? '已设置，留空保持不变' : '请输入 Admin Token';
-            document.getElementById('edit-fm-domain').value = service.config?.domain || '';
+            const freemailDomains = service.config?.domain;
+            document.getElementById('edit-fm-domain').value = Array.isArray(freemailDomains) ? freemailDomains.join(', ') : (freemailDomains || '');
         } else if (resolvedSubType === 'cloudmail') {
             document.getElementById('edit-cm-base-url').value = service.config?.base_url || '';
             document.getElementById('edit-cm-admin-email').value = service.config?.admin_email || '';
@@ -703,80 +734,87 @@ async function editCustomService(id, subType) {
 // 保存编辑自定义邮箱服务
 async function handleEditCustom(e) {
     e.preventDefault();
-    const id = document.getElementById('edit-custom-id').value;
-    const formData = new FormData(e.target);
-    const subType = formData.get('sub_type');
-
-    let config;
-    if (subType === 'moemail') {
-        config = {
-            base_url: formData.get('api_url'),
-            default_domain: formData.get('domain')
-        };
-        const apiKey = formData.get('api_key');
-        if (apiKey && apiKey.trim()) config.api_key = apiKey.trim();
-    } else if (subType === 'tempmail') {
-        config = {
-            base_url: formData.get('tm_base_url'),
-            domain: formData.get('tm_domain'),
-            enable_prefix: true
-        };
-        const pwd = formData.get('tm_admin_password');
-        if (pwd && pwd.trim()) config.admin_password = pwd.trim();
-    } else if (subType === 'duckmail') {
-        config = {
-            base_url: formData.get('dm_base_url'),
-            default_domain: formData.get('dm_domain'),
-            password_length: parseInt(formData.get('dm_password_length'), 10) || 12
-        };
-        const apiKey = formData.get('dm_api_key');
-        if (apiKey && apiKey.trim()) config.api_key = apiKey.trim();
-    } else if (subType === 'freemail') {
-        config = {
-            base_url: formData.get('fm_base_url'),
-            domain: formData.get('fm_domain')
-        };
-        const token = formData.get('fm_admin_token');
-        if (token && token.trim()) config.admin_token = token.trim();
-    } else if (subType === 'cloudmail') {
-        const domainInput = formData.get('cm_domain');
-        // 处理域名：如果包含逗号，转换为数组；否则保持字符串
-        let domain = domainInput;
-        if (domainInput && domainInput.includes(',')) {
-            domain = domainInput.split(',').map(d => d.trim()).filter(d => d);
-        }
-        config = {
-            base_url: formData.get('cm_base_url'),
-            admin_email: formData.get('cm_admin_email'),
-            domain: domain
-        };
-        const pwd = formData.get('cm_admin_password');
-        if (pwd && pwd.trim()) config.admin_password = pwd.trim();
-    } else {
-        config = {
-            host: formData.get('imap_host'),
-            port: parseInt(formData.get('imap_port'), 10) || 993,
-            use_ssl: formData.get('imap_use_ssl') !== 'false',
-            email: formData.get('imap_email')
-        };
-        const pwd = formData.get('imap_password');
-        if (pwd && pwd.trim()) config.password = pwd.trim();
-    }
-
-    const updateData = {
-        name: formData.get('name'),
-        priority: parseInt(formData.get('priority')) || 0,
-        enabled: formData.get('enabled') === 'on',
-        config
-    };
-
     try {
+        const id = document.getElementById('edit-custom-id').value;
+        const formData = new FormData(e.target);
+        const subType = formData.get('sub_type');
+
+        if (!id) {
+            throw new Error('未找到服务 ID，请关闭弹窗后重试');
+        }
+        if (!subType) {
+            throw new Error('未识别到服务类型，请重新打开编辑弹窗');
+        }
+
+        let config;
+        if (subType === 'moemail') {
+            config = {
+                base_url: formData.get('api_url'),
+                default_domain: formData.get('domain')
+            };
+            const apiKey = formData.get('api_key');
+            if (apiKey && apiKey.trim()) config.api_key = apiKey.trim();
+        } else if (subType === 'tempmail') {
+            config = {
+                base_url: formData.get('tm_base_url'),
+                domain: formData.get('tm_domain'),
+                enable_prefix: true
+            };
+            const pwd = formData.get('tm_admin_password');
+            if (pwd && pwd.trim()) config.admin_password = pwd.trim();
+        } else if (subType === 'duckmail') {
+            config = {
+                base_url: formData.get('dm_base_url'),
+                default_domain: parseDomainList(formData.get('dm_domain')),
+                password_length: parseInt(formData.get('dm_password_length'), 10) || 12
+            };
+            const apiKey = formData.get('dm_api_key');
+            if (apiKey && apiKey.trim()) config.api_key = apiKey.trim();
+        } else if (subType === 'freemail') {
+            config = {
+                base_url: formData.get('fm_base_url'),
+                domain: parseDomainList(formData.get('fm_domain'))
+            };
+            const token = formData.get('fm_admin_token');
+            if (token && token.trim()) config.admin_token = token.trim();
+        } else if (subType === 'cloudmail') {
+            const domainInput = formData.get('cm_domain');
+            let domain = domainInput;
+            if (domainInput && domainInput.includes(',')) {
+                domain = domainInput.split(',').map(d => d.trim()).filter(d => d);
+            }
+            config = {
+                base_url: formData.get('cm_base_url'),
+                admin_email: formData.get('cm_admin_email'),
+                domain: domain
+            };
+            const pwd = formData.get('cm_admin_password');
+            if (pwd && pwd.trim()) config.admin_password = pwd.trim();
+        } else {
+            config = {
+                host: formData.get('imap_host'),
+                port: parseInt(formData.get('imap_port'), 10) || 993,
+                use_ssl: formData.get('imap_use_ssl') !== 'false',
+                email: formData.get('imap_email')
+            };
+            const pwd = formData.get('imap_password');
+            if (pwd && pwd.trim()) config.password = pwd.trim();
+        }
+
+        const updateData = {
+            name: formData.get('name'),
+            priority: parseInt(formData.get('priority')) || 0,
+            enabled: formData.get('enabled') === 'on',
+            config
+        };
+
         await api.patch(`/email-services/${id}`, updateData);
         toast.success('服务更新成功');
         elements.editCustomModal.classList.remove('active');
         loadCustomServices();
         loadStats();
     } catch (error) {
+        console.error('更新邮箱服务失败:', error);
         toast.error('更新失败: ' + error.message);
     }
 }

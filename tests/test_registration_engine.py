@@ -70,11 +70,21 @@ class FakeEmailService(BaseEmailService):
             "service_id": "mailbox-1",
         }
 
-    def get_verification_code(self, email, email_id=None, timeout=120, pattern=r"(?<!\d)(\d{6})(?!\d)", otp_sent_at=None):
+    def get_verification_code(
+        self,
+        email,
+        email_id=None,
+        timeout=120,
+        pattern=r"(?<!\d)(\d{6})(?!\d)",
+        otp_sent_at=None,
+        poll_interval=3,
+    ):
         self.otp_requests.append({
             "email": email,
             "email_id": email_id,
+            "timeout": timeout,
             "otp_sent_at": otp_sent_at,
+            "poll_interval": poll_interval,
         })
         if not self.codes:
             raise AssertionError("no verification code queued")
@@ -116,6 +126,35 @@ class FakeOAuthManager:
             "refresh_token": "refresh-1",
             "id_token": "id-1",
         }
+
+
+class FailingEmailService(BaseEmailService):
+    def __init__(self, message):
+        super().__init__(EmailServiceType.DUCK_MAIL)
+        self.message = message
+
+    def create_email(self, config=None):
+        raise RuntimeError(self.message)
+
+    def get_verification_code(
+        self,
+        email,
+        email_id=None,
+        timeout=120,
+        pattern=r"(?<!\d)(\d{6})(?!\d)",
+        otp_sent_at=None,
+        poll_interval=3,
+    ):
+        return None
+
+    def list_emails(self, **kwargs):
+        return []
+
+    def delete_email(self, email_id):
+        return True
+
+    def check_health(self):
+        return False
 
 
 class FakeOpenAIClient:
@@ -253,6 +292,16 @@ def test_run_registers_then_relogs_to_fetch_token():
     password_verify_body = json.loads(session_two.calls[2]["kwargs"]["data"])
     assert password_verify_body == {"password": result.password}
     assert result.metadata["token_acquired_via_relogin"] is True
+
+
+def test_run_surfaces_create_email_error_details():
+    engine = RegistrationEngine(FailingEmailService("Domain not found."))
+    engine.http_client = FakeOpenAIClient([QueueSession([])], [])
+
+    result = engine.run()
+
+    assert result.success is False
+    assert result.error_message == "创建邮箱失败: Domain not found."
 
 
 def test_existing_account_login_uses_auto_sent_otp_without_manual_send():

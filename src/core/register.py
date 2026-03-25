@@ -152,6 +152,7 @@ class RegistrationEngine:
         self._last_otp_validation_code: Optional[str] = None
         self._last_otp_validation_status_code: Optional[int] = None
         self._last_otp_validation_outcome: str = ""  # success/http_non_200/network_timeout/network_error
+        self._email_creation_error: Optional[str] = None
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -358,11 +359,13 @@ class RegistrationEngine:
     def _create_email(self) -> bool:
         """创建邮箱"""
         try:
+            self._email_creation_error = None
             self._log(f"正在创建 {self.email_service.service_type.value} 邮箱，先给新账号整个收件箱...")
             self.email_info = self.email_service.create_email()
 
             if not self.email_info or "email" not in self.email_info:
-                self._log("创建邮箱失败: 返回信息不完整", "error")
+                self._email_creation_error = "返回信息不完整"
+                self._log(f"创建邮箱失败: {self._email_creation_error}", "error")
                 return False
 
             raw_email = str(self.email_info["email"] or "").strip()
@@ -380,7 +383,8 @@ class RegistrationEngine:
             return True
 
         except Exception as e:
-            self._log(f"创建邮箱失败: {e}", "error")
+            self._email_creation_error = str(e)
+            self._log(f"创建邮箱失败: {self._email_creation_error}", "error")
             return False
 
     def _start_oauth(self) -> bool:
@@ -2106,25 +2110,29 @@ class RegistrationEngine:
             mailbox_email = str(self.inbox_email or self.email or "").strip()
             self._log(f"正在等待邮箱 {mailbox_email} 的验证码...")
 
+            settings = get_settings()
+            resolved_timeout = timeout
+            if resolved_timeout is None:
+                resolved_timeout = max(10, int(getattr(settings, "email_code_timeout", 120) or 120))
+            else:
+                resolved_timeout = max(10, int(resolved_timeout))
+            poll_interval = max(1, int(getattr(settings, "email_code_poll_interval", 3) or 3))
+
             email_id = self.email_info.get("service_id") if self.email_info else None
-            fetch_timeout = int(timeout) if timeout and int(timeout) > 0 else 120
             code = self.email_service.get_verification_code(
                 email=mailbox_email,
                 email_id=email_id,
-<<<<<<< HEAD
-                timeout=30,
-=======
-                timeout=fetch_timeout,
->>>>>>> upstream/main
+                timeout=resolved_timeout,
                 pattern=OTP_CODE_PATTERN,
                 otp_sent_at=self._otp_sent_at,
+                poll_interval=poll_interval,
             )
 
             if code:
                 self._log(f"成功获取验证码: {code}")
                 return code
             else:
-                self._log("等待验证码超时", "error")
+                self._log(f"等待验证码超时（{resolved_timeout} 秒）", "error")
                 return None
 
         except Exception as e:
@@ -2668,7 +2676,11 @@ class RegistrationEngine:
             # 2. 创建邮箱
             self._log("2. 开个新邮箱，准备收信...")
             if not self._create_email():
-                result.error_message = "创建邮箱失败"
+                result.error_message = (
+                    f"创建邮箱失败: {self._email_creation_error}"
+                    if self._email_creation_error else
+                    "创建邮箱失败"
+                )
                 return result
 
             result.email = self.email

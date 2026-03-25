@@ -203,7 +203,7 @@
                 <button class="modal-close" id="close-custom-modal">&times;</button>
             </div>
             <div class="modal-body">
-                <form id="add-custom-form">
+                <form id="add-custom-form" novalidate>
                     <div class="form-group">
                         <label for="custom-name">服务名称</label>
                         <input type="text" id="custom-name" name="name" required placeholder="例如：我的域名邮箱">
@@ -261,7 +261,8 @@
                         </div>
                         <div class="form-group">
                             <label for="custom-dm-domain">默认域名</label>
-                            <input type="text" id="custom-dm-domain" name="dm_domain" placeholder="example.com">
+                            <input type="text" id="custom-dm-domain" name="dm_domain" placeholder="duckmail.sbs,baldur.edu.kg">
+                            <small style="color: var(--text-muted);">支持多个域名，用英文逗号分隔，注册时会自动选一个可用域名</small>
                         </div>
                         <div class="form-group">
                             <label for="custom-dm-password-length">随机密码长度</label>
@@ -280,7 +281,8 @@
                         </div>
                         <div class="form-group">
                             <label for="custom-fm-domain">邮箱域名 (可选)</label>
-                            <input type="text" id="custom-fm-domain" name="fm_domain" placeholder="example.com">
+                            <input type="text" id="custom-fm-domain" name="fm_domain" placeholder="example.com 或 domain1.com,domain2.com">
+                            <small style="color: var(--text-muted);">支持多个域名，用英文逗号分隔，注册时会随机选择一个可用域名</small>
                         </div>
                     </div>
                     <!-- IMAP 字段 -->
@@ -362,7 +364,7 @@
                 <button class="modal-close" id="close-edit-custom-modal">&times;</button>
             </div>
             <div class="modal-body">
-                <form id="edit-custom-form">
+                <form id="edit-custom-form" novalidate>
                     <input type="hidden" id="edit-custom-id" name="id">
                     <input type="hidden" id="edit-custom-sub-type-hidden" name="sub_type">
                     <div class="form-group">
@@ -418,7 +420,8 @@
                         </div>
                         <div class="form-group">
                             <label for="edit-dm-domain">默认域名</label>
-                            <input type="text" id="edit-dm-domain" name="dm_domain" placeholder="example.com">
+                            <input type="text" id="edit-dm-domain" name="dm_domain" placeholder="duckmail.sbs,baldur.edu.kg">
+                            <small style="color: var(--text-muted);">支持多个域名，用英文逗号分隔，注册时会自动选一个可用域名</small>
                         </div>
                         <div class="form-group">
                             <label for="edit-dm-password-length">随机密码长度</label>
@@ -438,7 +441,8 @@
                         </div>
                         <div class="form-group">
                             <label for="edit-fm-domain">邮箱域名 (可选)</label>
-                            <input type="text" id="edit-fm-domain" name="fm_domain" placeholder="example.com">
+                            <input type="text" id="edit-fm-domain" name="fm_domain" placeholder="example.com 或 domain1.com,domain2.com">
+                            <small style="color: var(--text-muted);">支持多个域名，用英文逗号分隔，注册时会随机选择一个可用域名</small>
                         </div>
                     </div>
                     <!-- IMAP 字段 -->
@@ -520,7 +524,7 @@
                 <button class="modal-close" id="close-edit-outlook-modal">&times;</button>
             </div>
             <div class="modal-body">
-                <form id="edit-outlook-form">
+                <form id="edit-outlook-form" novalidate>
                     <input type="hidden" id="edit-outlook-id" name="id">
                     <div class="form-group">
                         <label for="edit-outlook-email">邮箱地址</label>

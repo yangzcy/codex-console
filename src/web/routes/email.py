@@ -94,6 +94,44 @@ SENSITIVE_FIELDS = {
     'custom_auth',
 }
 
+
+def parse_domain_list(value: Any) -> Any:
+    if isinstance(value, list):
+        items = [str(item).strip() for item in value if str(item).strip()]
+        return items if len(items) > 1 else (items[0] if items else "")
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            import json
+
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                items = [str(item).strip() for item in parsed if str(item).strip()]
+                return items if len(items) > 1 else (items[0] if items else "")
+        except Exception:
+            pass
+
+    items = [item.strip() for item in text.split(",") if item.strip()]
+    return items if len(items) > 1 else (items[0] if items else "")
+
+
+def normalize_service_config(service_type: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(config or {})
+    service_key = str(service_type or "").strip().lower()
+
+    if service_key == "freemail":
+        normalized["domain"] = parse_domain_list(normalized.get("domain"))
+    elif service_key in ("cloud_mail", "cloudmail"):
+        normalized["domain"] = parse_domain_list(normalized.get("domain"))
+    elif service_key == "duck_mail":
+        normalized["default_domain"] = parse_domain_list(normalized.get("default_domain"))
+
+    return normalized
+
 def filter_sensitive_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """过滤敏感配置信息"""
     if not config:
@@ -229,7 +267,7 @@ async def get_service_types():
                 "description": "DuckMail 接口邮箱服务，支持 API Key 私有域名访问",
                 "config_fields": [
                     {"name": "base_url", "label": "API 地址", "required": True, "placeholder": "https://api.duckmail.sbs"},
-                    {"name": "default_domain", "label": "默认域名", "required": True, "placeholder": "duckmail.sbs"},
+                    {"name": "default_domain", "label": "默认域名", "required": True, "placeholder": "duckmail.sbs,baldur.edu.kg"},
                     {"name": "api_key", "label": "API Key", "required": False, "secret": True},
                     {"name": "password_length", "label": "随机密码长度", "required": False, "default": 12},
                 ]
@@ -241,7 +279,7 @@ async def get_service_types():
                 "config_fields": [
                     {"name": "base_url", "label": "API 地址", "required": True, "placeholder": "https://freemail.example.com"},
                     {"name": "admin_token", "label": "Admin Token", "required": True, "secret": True},
-                    {"name": "domain", "label": "邮箱域名", "required": False, "placeholder": "example.com"},
+                    {"name": "domain", "label": "邮箱域名", "required": False, "placeholder": "example.com 或 domain1.com,domain2.com"},
                 ]
             },
             {
@@ -332,7 +370,7 @@ async def create_email_service(request: EmailServiceCreate):
         service = EmailServiceModel(
             service_type=request.service_type,
             name=request.name,
-            config=request.config,
+            config=normalize_service_config(request.service_type, request.config),
             enabled=request.enabled,
             priority=request.priority
         )
@@ -360,7 +398,7 @@ async def update_email_service(service_id: int, request: EmailServiceUpdate):
             merged_config = {**current_config, **request.config}
             # 移除空值
             merged_config = {k: v for k, v in merged_config.items() if v}
-            update_data["config"] = merged_config
+            update_data["config"] = normalize_service_config(service.service_type, merged_config)
         if request.enabled is not None:
             update_data["enabled"] = request.enabled
         if request.priority is not None:

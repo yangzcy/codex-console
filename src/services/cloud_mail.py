@@ -4,6 +4,7 @@ Cloud Mail 邮箱服务实现
 """
 
 import re
+import sys
 import time
 import logging
 import random
@@ -163,6 +164,20 @@ class CloudMailService(BaseEmailService):
             "Accept": "application/json",
         }
 
+    @staticmethod
+    def _is_auth_error_response(data: Any) -> bool:
+        """判断 Cloud Mail 是否返回了业务层认证错误。"""
+        if not isinstance(data, dict):
+            return False
+
+        message = str(data.get("message", ""))
+        code = data.get("code")
+        return (
+            code in {401, 403}
+            or "token验证失败" in message
+            or ("token" in message.lower() and "失败" in message)
+        )
+
     def _make_request(
         self,
         method: str,
@@ -211,9 +226,21 @@ class CloudMailService(BaseEmailService):
                     raise EmailServiceError(error_msg)
 
             try:
-                return response.json()
+                data = response.json()
             except Exception:
                 return {"raw_response": response.text}
+
+            # Cloud Mail 有时会返回 HTTP 200，但在业务层提示 token 失效
+            if retry_on_auth_error and self._is_auth_error_response(data):
+                logger.warning("Cloud Mail 返回业务层 token 失效，尝试刷新 token")
+                kwargs["headers"].update(self._get_headers(self._get_token(force_refresh=True)))
+                response = self.session.request(method, url, **kwargs)
+                try:
+                    data = response.json()
+                except Exception:
+                    return {"raw_response": response.text}
+
+            return data
 
         except requests.RequestException as e:
             self.update_status(False, e)
@@ -340,6 +367,7 @@ class CloudMailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        poll_interval: int = 3,
     ) -> Optional[str]:
         """
         从 Cloud Mail 邮箱获取验证码
@@ -350,6 +378,7 @@ class CloudMailService(BaseEmailService):
             timeout: 超时时间（秒）
             pattern: 验证码正则
             otp_sent_at: OTP 发送时间戳
+            poll_interval: 轮询间隔（秒）
 
         Returns:
             验证码字符串，超时返回 None
@@ -377,12 +406,12 @@ class CloudMailService(BaseEmailService):
                 result = self._make_request("POST", url_path, json=payload)
 
                 if result.get("code") != 200:
-                    time.sleep(3)
+                    time.sleep(poll_interval)
                     continue
 
                 emails = result.get("data", [])
                 if not isinstance(emails, list):
-                    time.sleep(3)
+                    time.sleep(poll_interval)
                     continue
 
                 for email_item in emails:
@@ -443,7 +472,7 @@ class CloudMailService(BaseEmailService):
                         sys.stdout.flush()
                 logger.error(f"检查邮件时出错: {e}", exc_info=True)
 
-            time.sleep(3)
+            time.sleep(poll_interval)
 
         print(f"[CloudMail] 超时！检查{check_count}次，已处理: {list(seen_ids)}", flush=True)
         sys.stdout.flush()

@@ -1655,7 +1655,8 @@ function openCheckout() {
     }
 }
 
-// 无痕打开浏览器（携带账号 cookie）
+// 浏览器安全限制下，网页不能直接拉起用户本机无痕窗口。
+// 这里退化为普通新标签页打开，并明确提示用户如需无痕请手动粘贴。
 async function openIncognito() {
     if (!generatedLink) {
         toast.warning("请先生成链接");
@@ -1674,11 +1675,22 @@ async function openIncognito() {
             if (statusEl) statusEl.textContent = "已在无痕模式打开浏览器";
             toast.success("无痕浏览器已打开");
         } else {
-            if (statusEl) statusEl.textContent = data?.message || "未找到可用浏览器，请手动复制链接";
+            if (statusEl) {
+                statusEl.textContent = data?.message || "未找到可用浏览器，已尝试在新标签页中打开";
+            }
+            const opened = window.open(generatedLink, "_blank", "noopener,noreferrer");
+            if (!opened) {
+                if (statusEl) statusEl.textContent = data?.message || "未找到可用浏览器，请手动复制链接";
+            }
             toast.warning(data?.message || "未找到可用浏览器");
         }
     } catch (e) {
-        if (statusEl) statusEl.textContent = `请求失败: ${formatErrorMessage(e)}`;
+        const opened = window.open(generatedLink, "_blank", "noopener,noreferrer");
+        if (statusEl) {
+            statusEl.textContent = opened
+                ? "接口请求失败，已回退到新标签页打开；如需无痕请手动复制链接"
+                : `请求失败: ${formatErrorMessage(e)}`;
+        }
         toast.error(`请求失败: ${formatErrorMessage(e)}`);
     }
 }

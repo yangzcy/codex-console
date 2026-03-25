@@ -3,13 +3,14 @@ HTTP 客户端封装
 基于 curl_cffi 的 HTTP 请求封装，支持代理和错误处理
 """
 
+import os
 import time
 import json
 from typing import Optional, Dict, Any, Union, Tuple
 from dataclasses import dataclass
 import logging
 
-from curl_cffi import requests as cffi_requests
+from curl_cffi import CurlOpt, requests as cffi_requests
 from curl_cffi.requests import Session, Response
 
 from ..config.constants import ERROR_MESSAGES
@@ -18,6 +19,39 @@ from .openai.sentinel import SentinelPOWError, build_sentinel_pow_token
 
 
 logger = logging.getLogger(__name__)
+
+
+def _has_usable_ipv6_default_route() -> bool:
+    """
+    检查系统是否存在非回环的 IPv6 默认路由。
+
+    某些环境会解析出 AAAA 记录，但实际上没有可用的 IPv6 出口，
+    这会导致 libcurl 偶发优先尝试 IPv6 并直接连接失败。
+    """
+    route_file = "/proc/net/ipv6_route"
+    if not os.path.exists(route_file):
+        return False
+
+    try:
+        with open(route_file, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 10:
+                    continue
+                dest, dest_prefix, _, _, _, _, _, _, _, iface = parts[:10]
+                if (
+                    dest == "00000000000000000000000000000000"
+                    and dest_prefix == "00"
+                    and iface != "lo"
+                ):
+                    return True
+    except Exception as e:
+        logger.debug(f"检测 IPv6 默认路由失败: {e}")
+
+    return False
+
+
+_FORCE_IPV4 = not _has_usable_ipv6_default_route()
 
 
 @dataclass
@@ -74,11 +108,16 @@ class HTTPClient:
     def session(self) -> Session:
         """获取会话对象（单例）"""
         if self._session is None:
+            curl_options = {}
+            if _FORCE_IPV4:
+                curl_options[CurlOpt.IPRESOLVE] = 1
+
             self._session = Session(
                 proxies=self.proxies,
                 impersonate=self.config.impersonate,
                 verify=self.config.verify_ssl,
-                timeout=self.config.timeout
+                timeout=self.config.timeout,
+                curl_options=curl_options,
             )
         return self._session
 

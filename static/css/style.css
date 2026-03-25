@@ -1227,15 +1227,21 @@ body {
 }
 
 .batch-stats span {
+    min-width: 72px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: var(--surface-hover);
+    border: 1px solid var(--border-light);
     color: var(--text-secondary);
-    font-size: 0.875rem;
+    font-size: 1rem;
+    line-height: 1;
 }
 
 .batch-stats strong {
     display: block;
-    font-size: 1.5rem;
+    font-size: 1.625rem;
     color: var(--text-primary);
-    margin-top: var(--spacing-xs);
+    margin-top: 8px;
     font-weight: 700;
 }
 

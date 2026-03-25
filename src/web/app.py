@@ -67,6 +67,16 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def disable_html_cache(request: Request, call_next):
+        response = await call_next(request)
+        content_type = response.headers.get("content-type", "")
+        if "text/html" in content_type:
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
     # 挂载静态文件
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

@@ -86,8 +86,8 @@ class BatchRegistrationRequest(BaseModel):
     proxy: Optional[str] = None
     email_service_config: Optional[dict] = None
     email_service_id: Optional[int] = None
-    interval_min: int = 5
-    interval_max: int = 30
+    interval_min: int = 20
+    interval_max: int = 60
     concurrency: int = 1
     mode: str = "pipeline"
     auto_upload_cpa: bool = False
@@ -104,6 +104,9 @@ class RegistrationTaskResponse(BaseModel):
     task_uuid: str
     status: str
     email_service_id: Optional[int] = None
+    email_service: Optional[str] = None
+    email_service_name: Optional[str] = None
+    email: Optional[str] = None
     proxy: Optional[str] = None
     logs: Optional[str] = None
     result: Optional[dict] = None
@@ -154,8 +157,8 @@ class OutlookBatchRegistrationRequest(BaseModel):
     service_ids: List[int]
     skip_registered: bool = True
     proxy: Optional[str] = None
-    interval_min: int = 5
-    interval_max: int = 30
+    interval_min: int = 20
+    interval_max: int = 60
     concurrency: int = 1
     mode: str = "pipeline"
     auto_upload_cpa: bool = False
@@ -177,13 +180,19 @@ class OutlookBatchRegistrationResponse(BaseModel):
 
 # ============== Helper Functions ==============
 
-def task_to_response(task: RegistrationTask) -> RegistrationTaskResponse:
+def task_to_response(task: RegistrationTask, db=None) -> RegistrationTaskResponse:
     """转换任务模型为响应"""
+    email_service, email_service_name = _resolve_task_email_service(task, db=db)
+    email = _resolve_task_email(task)
+
     return RegistrationTaskResponse(
         id=task.id,
         task_uuid=task.task_uuid,
         status=task.status,
         email_service_id=task.email_service_id,
+        email_service=email_service,
+        email_service_name=email_service_name,
+        email=email,
         proxy=task.proxy,
         logs=task.logs,
         result=task.result,
@@ -192,6 +201,62 @@ def task_to_response(task: RegistrationTask) -> RegistrationTaskResponse:
         started_at=task.started_at.isoformat() if task.started_at else None,
         completed_at=task.completed_at.isoformat() if task.completed_at else None,
     )
+
+
+SERVICE_DISPLAY_NAMES = {
+    "tempmail": "Tempmail.lol",
+    "outlook": "Outlook",
+    "moe_mail": "MoeMail",
+    "temp_mail": "Temp-Mail（自部署）",
+    "duck_mail": "DuckMail",
+    "freemail": "Freemail",
+    "imap_mail": "IMAP 邮箱",
+    "cloud_mail": "CloudMail",
+}
+
+
+def _resolve_task_email_service(task: RegistrationTask, db=None) -> Tuple[Optional[str], Optional[str]]:
+    """从任务结果或邮箱服务配置中解析服务类型和显示名。"""
+    result = task.result or {}
+    metadata = result.get("metadata") if isinstance(result, dict) else {}
+
+    service_type = None
+    if isinstance(metadata, dict):
+        service_type = metadata.get("email_service")
+
+    if not service_type and isinstance(result, dict):
+        service_type = result.get("email_service")
+
+    service_name = SERVICE_DISPLAY_NAMES.get(service_type) if service_type else None
+
+    if task.email_service_id:
+        from ...database.models import EmailService as EmailServiceModel
+        if db is not None:
+            service = db.query(EmailServiceModel).filter(EmailServiceModel.id == task.email_service_id).first()
+            if service:
+                if not service_type:
+                    service_type = service.service_type
+                service_name = service.name or SERVICE_DISPLAY_NAMES.get(service_type) or service_type
+        else:
+            with get_db() as local_db:
+                service = local_db.query(EmailServiceModel).filter(EmailServiceModel.id == task.email_service_id).first()
+                if service:
+                    if not service_type:
+                        service_type = service.service_type
+                    service_name = service.name or SERVICE_DISPLAY_NAMES.get(service_type) or service_type
+
+    if service_type and not service_name:
+        service_name = SERVICE_DISPLAY_NAMES.get(service_type, service_type)
+
+    return service_type, service_name
+
+
+def _resolve_task_email(task: RegistrationTask) -> Optional[str]:
+    """从任务结果中解析邮箱地址。"""
+    result = task.result or {}
+    if isinstance(result, dict) and result.get("email"):
+        return result.get("email")
+    return None
 
 
 def _normalize_email_service_config(
@@ -219,8 +284,6 @@ def _normalize_email_service_config(
         normalized['proxy_url'] = proxy_url
 
     return normalized
-
-
 def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None):
     """
     在线程池中执行的同步注册任务
@@ -1040,7 +1103,7 @@ async def list_tasks(
 
         return TaskListResponse(
             total=total,
-            tasks=[task_to_response(t) for t in tasks]
+            tasks=[task_to_response(t, db=db) for t in tasks]
         )
 
 
@@ -1051,7 +1114,7 @@ async def get_task(task_uuid: str):
         task = crud.get_registration_task(db, task_uuid)
         if not task:
             raise HTTPException(status_code=404, detail="任务不存在")
-        return task_to_response(task)
+        return task_to_response(task, db=db)
 
 
 @router.get("/tasks/{task_uuid}/logs")
@@ -1066,11 +1129,13 @@ async def get_task_logs(task_uuid: str):
         result = task.result if isinstance(task.result, dict) else {}
         email = result.get("email")
         service_type = task.email_service.service_type if task.email_service else None
+        email_service, email_service_name = _resolve_task_email_service(task, db=db)
         return {
             "task_uuid": task_uuid,
             "status": task.status,
-            "email": email,
-            "email_service": service_type,
+            "email": email or _resolve_task_email(task),
+            "email_service": service_type or email_service,
+            "email_service_name": email_service_name,
             "logs": logs.split("\n") if logs else []
         }
 

@@ -125,6 +125,7 @@ class TempmailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        poll_interval: int = 3,
     ) -> Optional[str]:
         """
         从 Tempmail.lol 获取验证码
@@ -135,6 +136,7 @@ class TempmailService(BaseEmailService):
             timeout: 超时时间（秒）
             pattern: 验证码正则表达式
             otp_sent_at: OTP 发送时间戳（Tempmail 服务暂不使用此参数）
+            poll_interval: 轮询间隔（秒）
 
         Returns:
             验证码字符串，如果超时或未找到返回 None
@@ -167,7 +169,7 @@ class TempmailService(BaseEmailService):
                 )
 
                 if response.status_code != 200:
-                    time.sleep(3)
+                    time.sleep(poll_interval)
                     continue
 
                 data = response.json()
@@ -180,7 +182,7 @@ class TempmailService(BaseEmailService):
                 email_list = data.get("emails", []) if isinstance(data, dict) else []
 
                 if not isinstance(email_list, list):
-                    time.sleep(3)
+                    time.sleep(poll_interval)
                     continue
 
                 for msg in email_list:
@@ -216,7 +218,7 @@ class TempmailService(BaseEmailService):
                 logger.debug(f"检查邮件时出错: {e}")
 
             # 等待一段时间再检查
-            time.sleep(3)
+            time.sleep(poll_interval)
 
         logger.warning(f"等验证码等到超时了: {email}")
         return None

@@ -194,7 +194,19 @@ class ApiClient {
 
         try {
             const response = await fetch(url, finalOptions);
-            const data = await response.json().catch(() => ({}));
+            const contentType = response.headers.get('content-type') || '';
+            const isJson = contentType.includes('application/json');
+            const data = isJson ? await response.json().catch(() => ({})) : {};
+
+            if (!isJson) {
+                const redirectedToLogin = response.redirected && response.url.includes('/login');
+                if (redirectedToLogin || contentType.includes('text/html')) {
+                    const error = new Error('登录已失效，请刷新页面后重新登录');
+                    error.response = response;
+                    error.data = data;
+                    throw error;
+                }
+            }
 
             if (!response.ok) {
                 const error = new Error(data.detail || `HTTP ${response.status}`);
@@ -355,7 +367,8 @@ const statusMap = {
         temp_mail: 'Temp-Mail（自部署）',
         duck_mail: 'DuckMail',
         freemail: 'Freemail',
-        imap_mail: 'IMAP 邮箱'
+        imap_mail: 'IMAP 邮箱',
+        cloud_mail: 'CloudMail'
     }
 };
 

@@ -121,6 +121,7 @@ class ImapMailService(BaseEmailService):
         timeout: int = 60,
         pattern: str = None,
         otp_sent_at: Optional[float] = None,
+        poll_interval: int = 3,
     ) -> Optional[str]:
         """轮询 IMAP 收件箱，获取 OpenAI 验证码"""
         start_time = time.time()
@@ -136,7 +137,7 @@ class ImapMailService(BaseEmailService):
                     # 搜索所有未读邮件
                     status, data = mail.search(None, "UNSEEN")
                     if status != "OK" or not data or not data[0]:
-                        time.sleep(3)
+                        time.sleep(poll_interval)
                         continue
 
                     msg_ids = data[0].split()
@@ -177,7 +178,7 @@ class ImapMailService(BaseEmailService):
                     except Exception:
                         pass
 
-                time.sleep(3)
+                time.sleep(poll_interval)
 
         except Exception as e:
             logger.warning(f"IMAP 连接/轮询失败: {e}")

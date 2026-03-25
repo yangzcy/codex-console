@@ -262,6 +262,7 @@ class MeoMailEmailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        poll_interval: int = 3,
     ) -> Optional[str]:
         """
         从自定义域名邮箱获取验证码
@@ -272,6 +273,7 @@ class MeoMailEmailService(BaseEmailService):
             timeout: 超时时间（秒）
             pattern: 验证码正则表达式
             otp_sent_at: OTP 发送时间戳（自定义域名服务暂不使用此参数）
+            poll_interval: 轮询间隔（秒）
 
         Returns:
             验证码字符串，如果超时或未找到返回 None
@@ -301,7 +303,7 @@ class MeoMailEmailService(BaseEmailService):
 
                 messages = response.get("messages", [])
                 if not isinstance(messages, list):
-                    time.sleep(3)
+                    time.sleep(poll_interval)
                     continue
 
                 for message in messages:
@@ -339,7 +341,7 @@ class MeoMailEmailService(BaseEmailService):
                 logger.debug(f"检查邮件时出错: {e}")
 
             # 等待一段时间再检查
-            time.sleep(3)
+            time.sleep(poll_interval)
 
         logger.warning(f"等待验证码超时: {email}")
         return None
