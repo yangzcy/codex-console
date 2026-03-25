@@ -211,6 +211,8 @@ class RegistrationEngine:
             or ("already exists for this email address" in create_error_msg)
             or (create_error_code == "user_already_exists")
             or (create_error_code == "user_exists")
+            or (create_error_code == "registration_disallowed")
+            or ("cannot create your account with the given information" in create_error_msg)
             or ("already exists" in register_error)
             or ("user_exists" in register_error)
         )
