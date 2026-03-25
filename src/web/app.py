@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from ..config.settings import get_settings
 from .routes import api_router
+from .routes.registration import recover_interrupted_batches
 from .routes.websocket import router as ws_router
 from .task_manager import task_manager
 
@@ -97,6 +98,10 @@ def create_app() -> FastAPI:
 
     # 注册 WebSocket 路由
     app.include_router(ws_router, prefix="/api")
+
+    @app.on_event("startup")
+    async def _recover_batches_on_startup():
+        recover_interrupted_batches()
 
     # 模板引擎
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))

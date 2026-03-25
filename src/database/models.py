@@ -106,6 +106,7 @@ class RegistrationTask(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     task_uuid = Column(String(36), unique=True, nullable=False, index=True)  # 任务唯一标识
+    batch_id = Column(String(36), index=True)  # 所属批量任务 ID
     status = Column(String(20), default='pending')  # 'pending', 'running', 'completed', 'failed', 'cancelled'
     email_service_id = Column(Integer, ForeignKey('email_services.id'), index=True)  # 使用的邮箱服务
     proxy = Column(String(255))  # 使用的代理
@@ -117,6 +118,40 @@ class RegistrationTask(Base):
     completed_at = Column(DateTime)
 
     # 关系
+    email_service = relationship('EmailService')
+
+
+class RegistrationBatch(Base):
+    """批量注册任务表"""
+    __tablename__ = 'registration_batches'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    batch_id = Column(String(36), unique=True, nullable=False, index=True)
+    batch_type = Column(String(30), default='standard')  # standard / outlook
+    mode = Column(String(20), default='pipeline')
+    status = Column(String(20), default='pending')
+    total = Column(Integer, default=0)
+    completed = Column(Integer, default=0)
+    success = Column(Integer, default=0)
+    failed = Column(Integer, default=0)
+    skipped = Column(Integer, default=0)
+    current_index = Column(Integer, default=0)
+    cancelled = Column(Boolean, default=False)
+    finished = Column(Boolean, default=False)
+    email_service_type = Column(String(50))
+    email_service_id = Column(Integer, ForeignKey('email_services.id'), index=True)
+    proxy = Column(String(255))
+    interval_min = Column(Integer)
+    interval_max = Column(Integer)
+    concurrency = Column(Integer)
+    request_payload = Column(JSONEncodedDict)
+    logs = Column(Text)
+    error_message = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
     email_service = relationship('EmailService')
 
 

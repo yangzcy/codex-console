@@ -7,7 +7,10 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, desc, asc, func
 
-from .models import Account, EmailService, RegistrationTask, Setting, Proxy, CpaService, Sub2ApiService
+from .models import (
+    Account, EmailService, RegistrationTask, RegistrationBatch, Setting,
+    Proxy, CpaService, Sub2ApiService
+)
 
 
 # ============================================================================
@@ -247,11 +250,13 @@ def create_registration_task(
     db: Session,
     task_uuid: str,
     email_service_id: Optional[int] = None,
-    proxy: Optional[str] = None
+    proxy: Optional[str] = None,
+    batch_id: Optional[str] = None,
 ) -> RegistrationTask:
     """创建注册任务"""
     db_task = RegistrationTask(
         task_uuid=task_uuid,
+        batch_id=batch_id,
         email_service_id=email_service_id,
         proxy=proxy,
         status='pending'
@@ -326,6 +331,98 @@ def delete_registration_task(db: Session, task_uuid: str) -> bool:
     db.delete(db_task)
     db.commit()
     return True
+
+
+def get_registration_tasks_by_batch_id(db: Session, batch_id: str) -> List[RegistrationTask]:
+    """获取某个批量任务下的注册任务列表"""
+    return db.query(RegistrationTask).filter(
+        RegistrationTask.batch_id == batch_id
+    ).order_by(asc(RegistrationTask.created_at), asc(RegistrationTask.id)).all()
+
+
+# ============================================================================
+# 批量注册任务 CRUD
+# ============================================================================
+
+def create_registration_batch(
+    db: Session,
+    batch_id: str,
+    batch_type: str = "standard",
+    mode: str = "pipeline",
+    total: int = 0,
+    email_service_type: Optional[str] = None,
+    email_service_id: Optional[int] = None,
+    proxy: Optional[str] = None,
+    interval_min: Optional[int] = None,
+    interval_max: Optional[int] = None,
+    concurrency: Optional[int] = None,
+    request_payload: Optional[dict] = None,
+) -> RegistrationBatch:
+    """创建批量注册任务"""
+    db_batch = RegistrationBatch(
+        batch_id=batch_id,
+        batch_type=batch_type,
+        mode=mode,
+        status="pending",
+        total=total,
+        email_service_type=email_service_type,
+        email_service_id=email_service_id,
+        proxy=proxy,
+        interval_min=interval_min,
+        interval_max=interval_max,
+        concurrency=concurrency,
+        request_payload=request_payload,
+    )
+    db.add(db_batch)
+    db.commit()
+    db.refresh(db_batch)
+    return db_batch
+
+
+def get_registration_batch_by_batch_id(db: Session, batch_id: str) -> Optional[RegistrationBatch]:
+    """根据 batch_id 获取批量注册任务"""
+    return db.query(RegistrationBatch).filter(RegistrationBatch.batch_id == batch_id).first()
+
+
+def update_registration_batch(
+    db: Session,
+    batch_id: str,
+    **kwargs
+) -> Optional[RegistrationBatch]:
+    """更新批量注册任务"""
+    db_batch = get_registration_batch_by_batch_id(db, batch_id)
+    if not db_batch:
+        return None
+
+    for key, value in kwargs.items():
+        if hasattr(db_batch, key):
+            setattr(db_batch, key, value)
+
+    db.commit()
+    db.refresh(db_batch)
+    return db_batch
+
+
+def append_registration_batch_log(db: Session, batch_id: str, log_message: str) -> bool:
+    """追加批量注册任务日志"""
+    db_batch = get_registration_batch_by_batch_id(db, batch_id)
+    if not db_batch:
+        return False
+
+    if db_batch.logs:
+        db_batch.logs += f"\n{log_message}"
+    else:
+        db_batch.logs = log_message
+
+    db.commit()
+    return True
+
+
+def get_unfinished_registration_batches(db: Session) -> List[RegistrationBatch]:
+    """获取所有未明确收尾的批量任务"""
+    return db.query(RegistrationBatch).filter(
+        RegistrationBatch.finished.is_(False)
+    ).order_by(asc(RegistrationBatch.created_at), asc(RegistrationBatch.id)).all()
 
 
 # 为 API 路由添加别名

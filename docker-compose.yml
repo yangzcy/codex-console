@@ -1,10 +1,11 @@
-version: '3.8'
-
 services:
   webui:
     build: .
     shm_size: "1gb"
     container_name: codex-console
+    networks:
+      - default
+      - sub2api_net
     ports:
       - "${WEBUI_PORT:-1455}:${WEBUI_PORT:-1455}"
       - "6080:6080"
@@ -26,3 +27,8 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
     restart: unless-stopped
+
+networks:
+  sub2api_net:
+    external: true
+    name: deploy_sub2api-network

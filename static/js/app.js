@@ -108,6 +108,31 @@ function getBatchEmptyToastText() {
         : `${getCurrentBatchServiceLabel()} 批量任务完成，但没有成功注册任何账号`;
 }
 
+function handleFinalBatchState(data) {
+    const status = data.status || 'completed';
+    const reason = data.error_message || '未知原因';
+
+    if (status === 'completed') {
+        addLog('info', getBatchCompletionMessage(data));
+        if (data.success > 0) {
+            toast.success(getBatchSuccessToastText(data.success));
+            loadRecentAccounts();
+        } else {
+            toast.warning(getBatchEmptyToastText());
+        }
+        return;
+    }
+
+    if (status === 'cancelled' || status === 'cancelling') {
+        addLog('warning', `[警告] ${getBatchTaskLabel()}已取消`);
+        toast.warning(`${getBatchTaskLabel()}已取消`);
+        return;
+    }
+
+    addLog('error', `[错误] ${getBatchTaskLabel()}失败: ${reason}`);
+    toast.error(`${getBatchTaskLabel()}失败: ${reason}`);
+}
+
 function getSelectedServiceLabel() {
     const select = elements.emailService;
     if (!select) {
@@ -1017,14 +1042,7 @@ function startBatchPolling(batchId) {
                 // 只显示一次 toast
                 if (!toastShown) {
                     toastShown = true;
-                    addLog('info', getBatchCompletionMessage(data));
-                    if (data.success > 0) {
-                        toast.success(`批量注册完成，成功 ${data.success} 个`);
-                        // 刷新账号列表
-                        loadRecentAccounts();
-                    } else {
-                        toast.warning('批量注册完成，但没有成功注册任何账号');
-                    }
+                    handleFinalBatchState(data);
                 }
             }
         } catch (error) {
@@ -1544,20 +1562,7 @@ function connectBatchWebSocket(batchId) {
                     // 只显示一次 toast
                     if (!toastShown) {
                         toastShown = true;
-                        if (data.status === 'completed') {
-                            addLog('success', getBatchCompletionMessage(data));
-                            if (data.success > 0) {
-                                toast.success(getBatchSuccessToastText(data.success));
-                                loadRecentAccounts();
-                            } else {
-                                toast.warning(getBatchEmptyToastText());
-                            }
-                        } else if (data.status === 'failed') {
-                            addLog('error', '[错误] 批量任务执行失败');
-                            toast.error('批量任务执行失败');
-                        } else if (data.status === 'cancelled' || data.status === 'cancelling') {
-                            addLog('warning', '[警告] 批量任务已取消');
-                        }
+                        handleFinalBatchState(data);
                     }
                 }
             } else if (data.type === 'pong') {
@@ -1660,13 +1665,7 @@ function startOutlookBatchPolling(batchId) {
                 // 只显示一次 toast
                 if (!toastShown) {
                     toastShown = true;
-                    addLog('info', getBatchCompletionMessage(data));
-                    if (data.success > 0) {
-                        toast.success(getBatchSuccessToastText(data.success));
-                        loadRecentAccounts();
-                    } else {
-                        toast.warning(getBatchEmptyToastText());
-                    }
+                    handleFinalBatchState(data);
                 }
             }
         } catch (error) {
@@ -1750,6 +1749,9 @@ async function restoreActiveTask() {
         try {
             const data = await api.get(endpoint);
             if (data.finished) {
+                showBatchStatus({ count: total || data.total });
+                updateBatchProgress(data);
+                handleFinalBatchState(data);
                 sessionStorage.removeItem('activeTask');
                 return;
             }

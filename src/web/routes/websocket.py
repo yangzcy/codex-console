@@ -5,9 +5,13 @@ WebSocket 路由
 
 import asyncio
 import logging
+from datetime import datetime
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..task_manager import task_manager
+from ...database import crud
+from ...database.session import get_db
+from .registration import _request_batch_cancel
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -66,6 +70,17 @@ async def task_websocket(websocket: WebSocket, task_uuid: str):
                 # 处理取消请求
                 elif data.get("type") == "cancel":
                     task_manager.cancel_task(task_uuid)
+                    with get_db() as db:
+                        task = crud.get_registration_task(db, task_uuid)
+                        if task and task.status in {"pending", "running"}:
+                            crud.update_registration_task(
+                                db,
+                                task_uuid,
+                                status="cancelled",
+                                completed_at=datetime.utcnow(),
+                                error_message="用户通过页面取消任务",
+                            )
+                    task_manager.update_status(task_uuid, "cancelling", error="用户通过页面取消任务")
                     await websocket.send_json({
                         "type": "status",
                         "task_uuid": task_uuid,
@@ -144,7 +159,7 @@ async def batch_websocket(websocket: WebSocket, batch_id: str):
 
                 # 处理取消请求
                 elif data.get("type") == "cancel":
-                    task_manager.cancel_batch(batch_id)
+                    _request_batch_cancel(batch_id)
                     await websocket.send_json({
                         "type": "status",
                         "batch_id": batch_id,

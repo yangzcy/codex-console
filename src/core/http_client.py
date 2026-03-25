@@ -403,13 +403,16 @@ class OpenAIHTTPClient(HTTPClient):
         from ..config.constants import OPENAI_API_ENDPOINTS
 
         try:
+            pow_started_at = time.monotonic()
             pow_token = build_sentinel_pow_token(self.default_headers.get("User-Agent", ""))
+            logger.info(f"Sentinel POW 本地求解完成，耗时 {time.monotonic() - pow_started_at:.2f}s")
             sen_req_body = json.dumps({
                 "p": pow_token,
                 "id": did,
                 "flow": "authorize_continue",
             }, separators=(",", ":"))
 
+            request_started_at = time.monotonic()
             response = self.post(
                 OPENAI_API_ENDPOINTS["sentinel"],
                 headers={
@@ -418,6 +421,10 @@ class OpenAIHTTPClient(HTTPClient):
                     "content-type": "text/plain;charset=UTF-8",
                 },
                 data=sen_req_body,
+                timeout=15,
+            )
+            logger.info(
+                f"Sentinel 网络请求完成，状态 {response.status_code}，耗时 {time.monotonic() - request_started_at:.2f}s"
             )
 
             if response.status_code == 200:

@@ -110,6 +110,7 @@ class DatabaseSessionManager:
             ("accounts", "subscription_type", "VARCHAR(20)"),
             ("accounts", "subscription_at", "DATETIME"),
             ("accounts", "cookies", "TEXT"),
+            ("registration_tasks", "batch_id", "VARCHAR(36)"),
             ("proxies", "is_default", "BOOLEAN DEFAULT 0"),
             ("bind_card_tasks", "checkout_session_id", "VARCHAR(120)"),
             ("bind_card_tasks", "publishable_key", "VARCHAR(255)"),

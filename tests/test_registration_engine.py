@@ -4,7 +4,7 @@ import json
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
-from src.core.register import RegistrationEngine
+from src.core.register import RegistrationEngine, RegistrationResult, SignupFormResult
 from src.services.base import BaseEmailService
 
 
@@ -343,3 +343,299 @@ def test_existing_account_login_uses_auto_sent_otp_without_manual_send():
     assert len(email_service.otp_requests) == 1
     assert email_service.otp_requests[0]["otp_sent_at"] is not None
     assert result.metadata["token_acquired_via_relogin"] is False
+
+
+def test_verify_email_otp_retry_allows_same_code_after_new_send_window():
+    email_service = FakeEmailService(["111111", "111111"])
+    engine = RegistrationEngine(email_service)
+
+    validations = []
+
+    def fake_validate(code):
+        validations.append(code)
+        return len(validations) == 2
+
+    send_calls = []
+
+    def fake_send(referer=None):
+        send_calls.append(referer)
+        engine._otp_sent_at = 2000
+        return True
+
+    engine._validate_verification_code = fake_validate
+    engine._send_verification_code = fake_send
+    engine._otp_sent_at = 1000
+
+    tried_codes = set()
+    first_round = engine._verify_email_otp_with_retry(
+        stage_label="登录验证码",
+        max_attempts=1,
+        fetch_timeout=1,
+        attempted_codes=tried_codes,
+    )
+    resent = engine._send_verification_code(referer="https://auth.openai.com/email-verification")
+    second_round = engine._verify_email_otp_with_retry(
+        stage_label="登录验证码(原地重发)",
+        max_attempts=1,
+        fetch_timeout=1,
+        attempted_codes=tried_codes,
+    )
+
+    assert first_round is False
+    assert resent is True
+    assert second_round is True
+    assert validations == ["111111", "111111"]
+    assert send_calls == ["https://auth.openai.com/email-verification"]
+
+
+def test_login_otp_stops_current_round_on_wrong_code():
+    email_service = FakeEmailService(["111111", "222222"])
+    engine = RegistrationEngine(email_service)
+    engine._otp_sent_at = 1000
+
+    attempts = []
+
+    def fake_validate(code):
+        attempts.append(code)
+        engine._last_otp_validation_error_code = "wrong_email_otp_code"
+        engine._last_otp_validation_outcome = "http_non_200"
+        return False
+
+    engine._validate_verification_code = fake_validate
+
+    ok = engine._verify_email_otp_with_retry(
+        stage_label="登录验证码",
+        max_attempts=3,
+        fetch_timeout=10,
+        attempted_codes=set(),
+    )
+
+    assert ok is False
+    assert attempts == ["111111"]
+
+
+def test_login_otp_stops_current_round_when_continue_url_returns_registration_gate():
+    email_service = FakeEmailService(["111111"])
+    engine = RegistrationEngine(email_service)
+    engine._otp_sent_at = 1000
+    engine._token_acquisition_requires_login = True
+
+    def fake_validate(code):
+        engine._last_otp_validation_error_code = "login_continue_url_registration_gate"
+        engine._last_otp_validation_outcome = "semantic_reject"
+        return False
+
+    engine._validate_verification_code = fake_validate
+
+    ok = engine._verify_email_otp_with_retry(
+        stage_label="登录验证码(原地重发)",
+        max_attempts=3,
+        fetch_timeout=10,
+        attempted_codes=set(),
+    )
+
+    assert ok is False
+
+
+def test_otp_stops_current_round_on_max_check_attempts():
+    email_service = FakeEmailService(["111111", "222222"])
+    engine = RegistrationEngine(email_service)
+    engine._otp_sent_at = 1000
+
+    attempts = []
+
+    def fake_validate(code):
+        attempts.append(code)
+        engine._last_otp_validation_error_code = "max_check_attempts"
+        engine._last_otp_validation_outcome = "http_non_200"
+        return False
+
+    engine._validate_verification_code = fake_validate
+
+    ok = engine._verify_email_otp_with_retry(
+        stage_label="登录验证码(重发)",
+        max_attempts=3,
+        fetch_timeout=10,
+        attempted_codes=set(),
+    )
+
+    assert ok is False
+    assert attempts == ["111111"]
+
+
+def test_native_backup_falls_back_to_oauth_authorize_when_workspace_continue_is_gate_url():
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.session = QueueSession([])
+    fake_oauth = FakeOAuthManager()
+    engine.oauth_manager = fake_oauth
+
+    engine._last_validate_otp_workspace_id = "ws-gate"
+    engine._last_validate_otp_continue_url = "https://auth.openai.com/about-you"
+    engine._create_account_continue_url = "https://auth.openai.com/add-phone"
+
+    redirect_starts = []
+
+    engine._verify_email_otp_with_retry = lambda *args, **kwargs: True
+    engine._get_workspace_id = lambda: "ws-gate"
+    engine._select_workspace = lambda workspace_id: "https://auth.openai.com/add-phone"
+    engine._follow_redirects = lambda start_url: (
+        redirect_starts.append(start_url) or ("http://localhost:1455/auth/callback?code=code-3&state=state-1", start_url)
+    )
+    engine._handle_oauth_callback = lambda callback_url: {
+        "account_id": "acct-gate",
+        "access_token": "access-gate",
+        "refresh_token": "refresh-gate",
+        "id_token": "id-gate",
+    }
+
+    result = RegistrationResult(success=False, email="tester@example.com")
+
+    ok = engine._complete_token_exchange_native_backup(result)
+
+    assert ok is True
+    assert fake_oauth.start_calls == 1
+    assert redirect_starts == ["https://auth.example.test/flow/1"]
+    assert result.workspace_id == "ws-gate"
+    assert result.account_id == "acct-gate"
+    assert result.access_token == "access-gate"
+
+
+def test_native_backup_recovers_when_oauth_fallback_lands_on_login_page():
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.session = QueueSession([])
+    fake_oauth = FakeOAuthManager()
+    engine.oauth_manager = fake_oauth
+    engine.password = "pw-1"
+
+    engine._last_validate_otp_workspace_id = ""
+    engine._last_validate_otp_continue_url = "https://auth.openai.com/about-you"
+    engine._create_account_continue_url = "https://auth.openai.com/add-phone"
+
+    engine._verify_email_otp_with_retry = lambda *args, **kwargs: True
+    engine._get_workspace_id = lambda: ""
+    engine._select_workspace = lambda workspace_id: ""
+    engine._follow_redirects = lambda start_url: (None, "https://auth.openai.com/log-in")
+
+    def fake_bridge(result):
+        result.access_token = "bridge-access"
+        result.session_token = "bridge-session"
+        result.workspace_id = "bridge-ws"
+        return True
+
+    engine._bridge_login_for_session_token = fake_bridge
+
+    result = RegistrationResult(success=False, email="tester@example.com")
+
+    ok = engine._complete_token_exchange_native_backup(result)
+
+    assert ok is True
+    assert fake_oauth.start_calls == 1
+    assert result.access_token == "bridge-access"
+    assert result.session_token == "bridge-session"
+    assert result.workspace_id == "bridge-ws"
+    assert result.password == "pw-1"
+
+
+def test_native_backup_restarts_full_login_flow_when_bridge_recovery_fails():
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.session = QueueSession([])
+    fake_oauth = FakeOAuthManager()
+    engine.oauth_manager = fake_oauth
+    engine.password = "pw-2"
+    engine._create_account_account_id = "acct-created"
+    engine._create_account_workspace_id = "ws-created"
+    engine._create_account_refresh_token = "refresh-created"
+
+    follow_results = [
+        (None, "https://auth.openai.com/log-in"),
+        ("http://localhost:1455/auth/callback?code=code-2&state=state-2", "https://chatgpt.com/"),
+    ]
+    restart_calls = []
+    verify_calls = []
+
+    engine._verify_email_otp_with_retry = lambda *args, **kwargs: (verify_calls.append(kwargs.get("stage_label")) or True)
+    engine._get_workspace_id = lambda: ""
+    engine._select_workspace = lambda workspace_id: ""
+    engine._follow_redirects = lambda start_url: follow_results.pop(0)
+    engine._bridge_login_for_session_token = lambda result: False
+    def fake_restart_login_flow():
+        restart_calls.append(True)
+        engine.oauth_start = fake_oauth.start_oauth()
+        return True, ""
+
+    engine._restart_login_flow = fake_restart_login_flow
+    engine._handle_oauth_callback = lambda callback_url: {
+        "account_id": "acct-recovered",
+        "access_token": "access-recovered",
+        "refresh_token": "refresh-recovered",
+        "id_token": "id-recovered",
+    }
+
+    result = RegistrationResult(success=False, email="tester@example.com")
+
+    ok = engine._complete_token_exchange_native_backup(result)
+
+    assert ok is True
+    assert restart_calls == [True]
+    assert fake_oauth.start_calls == 2
+    assert verify_calls == ["登录验证码", "登录验证码"]
+    assert result.account_id == "acct-recovered"
+    assert result.workspace_id == "ws-created"
+    assert result.access_token == "access-recovered"
+    assert result.refresh_token == "refresh-recovered"
+    assert result.password == "pw-2"
+
+
+def test_run_retries_with_fresh_email_when_create_account_reports_existing_user():
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine._check_ip_location = lambda: (True, "US")
+
+    created_emails = []
+
+    def fake_create_email():
+        idx = len(created_emails) + 1
+        email = f"retry-{idx}@example.com"
+        created_emails.append(email)
+        engine.email = email
+        engine.inbox_email = email
+        engine.email_info = {"email": email, "service_id": email}
+        return True
+
+    create_account_outcomes = [
+        (False, "user_already_exists", "An account already exists for this email address."),
+        (True, "", ""),
+    ]
+
+    def fake_create_user_account():
+        ok, code, message = create_account_outcomes.pop(0)
+        engine._last_create_account_error_code = code
+        engine._last_create_account_error_message = message
+        return ok
+
+    complete_calls = []
+
+    engine._create_email = fake_create_email
+    engine._prepare_authorize_flow = lambda label: ("did-1", "sentinel-1")
+    engine._submit_signup_form = lambda did, sen: SignupFormResult(success=True)
+    engine._register_password = lambda did, sen: (True, "pw-1")
+    engine._send_verification_code = lambda referer=None: True
+    engine._verify_email_otp_with_retry = lambda *args, **kwargs: True
+    engine._create_user_account = fake_create_user_account
+    engine._restart_login_flow = lambda: (True, "")
+
+    def fake_complete(result):
+        complete_calls.append(result.email)
+        result.account_id = "acct-1"
+        result.workspace_id = "ws-1"
+        result.access_token = "access-1"
+        result.password = engine.password or "pw-1"
+        return True
+
+    engine._complete_token_exchange_native_backup = fake_complete
+
+    result = engine.run()
+
+    assert result.success is True
+    assert created_emails == ["retry-1@example.com", "retry-2@example.com"]
+    assert result.email == "retry-2@example.com"
+    assert complete_calls == ["retry-2@example.com"]
