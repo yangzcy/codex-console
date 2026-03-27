@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import List, Optional, Dict, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ...database import crud
 from ...database.session import get_db
@@ -263,6 +263,27 @@ class BatchRegistrationRequest(BaseModel):
     sub2api_service_ids: List[int] = []
     auto_upload_tm: bool = False
     tm_service_ids: List[int] = []
+
+    @field_validator("count", mode="before")
+    @classmethod
+    def validate_count(cls, value):
+        if value is None or value == "":
+            raise ValueError("注册数量不能为空")
+        if isinstance(value, bool):
+            raise ValueError("注册数量必须是正整数")
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("注册数量不能为空")
+            if not value.isdigit():
+                raise ValueError("注册数量必须是正整数")
+        elif not isinstance(value, int):
+            raise ValueError("注册数量必须是正整数")
+
+        count = int(value)
+        if count < 1:
+            raise ValueError("注册数量必须大于 0")
+        return count
 
 
 class RegistrationTaskResponse(BaseModel):
@@ -1278,16 +1299,13 @@ async def start_batch_registration(
     """
     启动批量注册任务
 
-    - count: 注册数量 (1-100)
+    - count: 注册数量 (正整数)
     - email_service_type: 邮箱服务类型
     - proxy: 代理地址
     - interval_min: 最小间隔秒数
     - interval_max: 最大间隔秒数
     """
     # 验证参数
-    if request.count < 1 or request.count > 100:
-        raise HTTPException(status_code=400, detail="注册数量必须在 1-100 之间")
-
     try:
         EmailServiceType(request.email_service_type)
     except ValueError:

@@ -868,7 +868,14 @@ async function handleBatchRegistration(requestData) {
     displayedLogs.clear();  // 清空日志去重集合
     toastShown = false;  // 重置 toast 标志
 
-    const count = parseInt(elements.batchCount.value) || 5;
+    const countRaw = String(elements.batchCount.value || '').trim();
+    if (!/^[1-9]\d*$/.test(countRaw)) {
+        addLog('error', '[错误] 注册数量必须是正整数');
+        toast.error('注册数量必须是正整数');
+        resetButtons();
+        return;
+    }
+    const count = parseInt(countRaw, 10);
     const intervalMin = parseInt(elements.intervalMin.value) || 5;
     const intervalMax = parseInt(elements.intervalMax.value) || 30;
     const concurrency = parseInt(elements.concurrencyCount.value) || 3;
