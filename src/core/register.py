@@ -169,11 +169,15 @@ class RegistrationEngine:
         self._email_creation_error: Optional[str] = None
         self._batch_wait_deferred: bool = False
         self._batch_wait_defer_reason: str = ""
+        self._batch_wait_defer_code: str = ""
 
     def _reset_registration_attempt_state(self, close_auth_flow: bool = True) -> None:
         """重置单次邮箱/注册尝试的局部状态，供更换新邮箱后重跑。"""
         self._is_existing_account = False
         self._token_acquisition_requires_login = False
+        self._batch_wait_deferred = False
+        self._batch_wait_defer_reason = ""
+        self._batch_wait_defer_code = ""
         self.email = None
         self.inbox_email = None
         self.password = None
@@ -236,8 +240,15 @@ class RegistrationEngine:
         return True
 
     def _mark_batch_wait_deferred(self, stage_label: str, wait_seconds: int):
+        self._mark_batch_deferred(
+            f"{stage_label}在 {wait_seconds} 秒片段内仍未收到验证码，先让出并发位稍后继续",
+            defer_code="otp_wait_timeout",
+        )
+
+    def _mark_batch_deferred(self, reason: str, *, defer_code: str = ""):
         self._batch_wait_deferred = True
-        self._batch_wait_defer_reason = f"{stage_label}在 {wait_seconds} 秒片段内仍未收到验证码，先让出并发位稍后继续"
+        self._batch_wait_defer_reason = str(reason or "").strip() or "当前阶段暂未完成，稍后继续"
+        self._batch_wait_defer_code = str(defer_code or "").strip()
         self._log(self._batch_wait_defer_reason, "warning")
 
     def _apply_batch_wait_deferred_result(self, result: RegistrationResult) -> bool:
@@ -246,8 +257,44 @@ class RegistrationEngine:
         metadata = dict(result.metadata or {})
         metadata["batch_wait_deferred"] = True
         metadata["batch_wait_defer_reason"] = self._batch_wait_defer_reason or "验证码暂未到达，稍后继续"
+        if self._batch_wait_defer_code:
+            metadata["batch_wait_defer_code"] = self._batch_wait_defer_code
         result.metadata = metadata
         result.error_message = self._batch_wait_defer_reason or "验证码暂未到达，稍后继续"
+        return True
+
+    @staticmethod
+    def _rate_limit_backoff_seconds(*, stage: str, attempt: int) -> int:
+        normalized_stage = str(stage or "").strip().lower()
+        attempt_index = max(0, int(attempt) - 1)
+        if normalized_stage in {"login_start", "login_password", "login"}:
+            backoff = (5, 15, 30)
+        else:
+            backoff = (5, 10, 18)
+        return backoff[min(attempt_index, len(backoff) - 1)]
+
+    @staticmethod
+    def _is_rate_limit_error(error_text: str) -> bool:
+        text = str(error_text or "").lower()
+        return ("429" in text) or ("rate limit" in text) or ("too many requests" in text)
+
+    def _defer_token_acquisition_rate_limit(self, result: RegistrationResult, login_error: str) -> bool:
+        if self._is_existing_account or not self._create_account_account_id or self.batch_wait_slice_seconds is None:
+            return False
+
+        retry_seconds = max(45, int(self.batch_wait_slice_seconds or 0))
+        result.account_id = result.account_id or str(self._create_account_account_id or "").strip()
+        result.workspace_id = result.workspace_id or str(
+            self._last_validate_otp_workspace_id or self._create_account_workspace_id or ""
+        ).strip()
+        result.refresh_token = result.refresh_token or str(self._create_account_refresh_token or "").strip()
+        result.password = self.password or ""
+        result.source = "register"
+        result.device_id = result.device_id or str(self.device_id or "")
+        self._mark_batch_deferred(
+            f"账号已创建成功，但登录补 token 命中限流，先让出并发位 {retry_seconds}s 后再试: {login_error}",
+            defer_code="token_acquisition_rate_limited",
+        )
         return True
 
     def _log(self, message: str, level: str = "info"):
@@ -637,7 +684,10 @@ class RegistrationEngine:
                 self._log(f"{log_label}状态: {response.status_code}")
 
                 if response.status_code == 429 and attempt < max_attempts:
-                    wait_seconds = min(18, 5 * attempt)
+                    wait_seconds = self._rate_limit_backoff_seconds(
+                        stage="login_start" if screen_hint == "login" else "signup_start",
+                        attempt=attempt,
+                    )
                     self._log(
                         f"{log_label}命中限流 429（第 {attempt}/{max_attempts} 次），{wait_seconds}s 后自动重试...",
                         "warning",
@@ -711,7 +761,8 @@ class RegistrationEngine:
                         f"{log_label}异常（第 {attempt}/{max_attempts} 次）: {e}，准备重试...",
                         "warning",
                     )
-                    time.sleep(2 * attempt)
+                    if not self._sleep_interruptible(2 * attempt):
+                        return SignupFormResult(success=False, error_message="任务已取消")
                     continue
                 self._log(f"{log_label}失败: {e}", "error")
                 return SignupFormResult(success=False, error_message=str(e))
@@ -783,12 +834,13 @@ class RegistrationEngine:
                 self._log(f"提交登录密码状态: {response.status_code}")
 
                 if response.status_code == 429 and attempt < max_attempts:
-                    wait_seconds = min(18, 5 * attempt)
+                    wait_seconds = self._rate_limit_backoff_seconds(stage="login_password", attempt=attempt)
                     self._log(
                         f"提交登录密码命中限流 429（第 {attempt}/{max_attempts} 次），{wait_seconds}s 后自动重试...",
                         "warning",
                     )
-                    time.sleep(wait_seconds)
+                    if not self._sleep_interruptible(wait_seconds):
+                        return SignupFormResult(success=False, error_message="任务已取消")
                     continue
 
                 if response.status_code == 401 and attempt < max_attempts:
@@ -1543,6 +1595,8 @@ class RegistrationEngine:
                 self._log("重触发登录 OTP 失败，尝试完整重登链路后再校验一次...", "warning")
                 login_ready, login_error = self._restart_login_flow()
                 if not login_ready:
+                    if self._is_rate_limit_error(login_error) and self._defer_token_acquisition_rate_limit(result, login_error):
+                        return False
                     result.error_message = f"登录验证码重触发失败，且完整重登失败: {login_error}"
                     return False
             login_otp_ok = self._verify_email_otp_with_retry(
@@ -1729,6 +1783,8 @@ class RegistrationEngine:
                 self._log("重触发登录 OTP 失败，尝试完整重登链路后再校验一次...", "warning")
                 login_ready, login_error = self._restart_login_flow()
                 if not login_ready:
+                    if self._is_rate_limit_error(login_error) and self._defer_token_acquisition_rate_limit(result, login_error):
+                        return False
                     result.error_message = f"登录验证码重触发失败，且完整重登失败: {login_error}"
                     return False
 
@@ -3010,6 +3066,9 @@ class RegistrationEngine:
                     if effective_entry_flow in {"native", "outlook"}:
                         login_ready, login_error = self._restart_login_flow()
                         if not login_ready:
+                            if self._is_rate_limit_error(login_error) and self._defer_token_acquisition_rate_limit(result, login_error):
+                                if self._apply_batch_wait_deferred_result(result):
+                                    return result
                             result.error_message = login_error
                             return result
                         if effective_entry_flow == "outlook":
