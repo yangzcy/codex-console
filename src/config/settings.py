@@ -48,7 +48,7 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
     ),
     "app_version": SettingDefinition(
         db_key="app.version",
-        default_value="1.1.0",
+        default_value="2.0.0",
         category=SettingCategory.GENERAL,
         description="应用版本"
     ),
@@ -93,6 +93,66 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
         category=SettingCategory.WEBUI,
         description="Web UI 访问密码",
         is_secret=True
+    ),
+    "auto_quick_refresh_enabled": SettingDefinition(
+        db_key="webui.auto_quick_refresh.enabled",
+        default_value=False,
+        category=SettingCategory.WEBUI,
+        description="是否启用账号管理自动一键刷新"
+    ),
+    "auto_quick_refresh_interval_minutes": SettingDefinition(
+        db_key="webui.auto_quick_refresh.interval_minutes",
+        default_value=30,
+        category=SettingCategory.WEBUI,
+        description="账号管理自动一键刷新间隔（分钟）"
+    ),
+    "auto_quick_refresh_retry_limit": SettingDefinition(
+        db_key="webui.auto_quick_refresh.retry_limit",
+        default_value=2,
+        category=SettingCategory.WEBUI,
+        description="账号管理自动一键刷新失败重试次数"
+    ),
+    "selfcheck_auto_enabled": SettingDefinition(
+        db_key="webui.selfcheck.auto_enabled",
+        default_value=False,
+        category=SettingCategory.WEBUI,
+        description="是否启用系统自检定时巡检"
+    ),
+    "selfcheck_interval_minutes": SettingDefinition(
+        db_key="webui.selfcheck.interval_minutes",
+        default_value=15,
+        category=SettingCategory.WEBUI,
+        description="系统自检定时巡检间隔（分钟）"
+    ),
+    "selfcheck_mode": SettingDefinition(
+        db_key="webui.selfcheck.mode",
+        default_value="quick",
+        category=SettingCategory.WEBUI,
+        description="系统自检定时巡检模式（quick/full）"
+    ),
+    "circuit_breaker_enabled": SettingDefinition(
+        db_key="runtime.circuit_breaker.enabled",
+        default_value=True,
+        category=SettingCategory.WEBUI,
+        description="是否启用失败熔断器"
+    ),
+    "circuit_breaker_failure_threshold": SettingDefinition(
+        db_key="runtime.circuit_breaker.failure_threshold",
+        default_value=5,
+        category=SettingCategory.WEBUI,
+        description="熔断触发连续失败次数阈值"
+    ),
+    "circuit_breaker_cooldown_seconds": SettingDefinition(
+        db_key="runtime.circuit_breaker.cooldown_seconds",
+        default_value=180,
+        category=SettingCategory.WEBUI,
+        description="熔断冷却时长（秒）"
+    ),
+    "circuit_breaker_probe_interval_seconds": SettingDefinition(
+        db_key="runtime.circuit_breaker.probe_interval_seconds",
+        default_value=30,
+        category=SettingCategory.WEBUI,
+        description="冷却结束后自动探活最小间隔（秒）"
     ),
 
     # 日志配置
@@ -401,6 +461,16 @@ SETTING_TYPES: Dict[str, Type] = {
     "proxy_enabled": bool,
     "proxy_port": int,
     "proxy_dynamic_enabled": bool,
+    "auto_quick_refresh_enabled": bool,
+    "auto_quick_refresh_interval_minutes": int,
+    "auto_quick_refresh_retry_limit": int,
+    "selfcheck_auto_enabled": bool,
+    "selfcheck_interval_minutes": int,
+    "selfcheck_mode": str,
+    "circuit_breaker_enabled": bool,
+    "circuit_breaker_failure_threshold": int,
+    "circuit_breaker_cooldown_seconds": int,
+    "circuit_breaker_probe_interval_seconds": int,
     "registration_max_retries": int,
     "registration_timeout": int,
     "registration_default_password_length": int,
@@ -592,7 +662,7 @@ class Settings(BaseModel):
 
     # 应用信息
     app_name: str = "OpenAI/Codex CLI 自动注册系统"
-    app_version: str = "1.1.0"
+    app_version: str = "2.0.0"
     debug: bool = False
 
     # 数据库配置
@@ -619,6 +689,16 @@ class Settings(BaseModel):
     webui_port: int = 8000
     webui_secret_key: SecretStr = SecretStr("your-secret-key-change-in-production")
     webui_access_password: SecretStr = SecretStr("admin123")
+    auto_quick_refresh_enabled: bool = False
+    auto_quick_refresh_interval_minutes: int = 30
+    auto_quick_refresh_retry_limit: int = 2
+    selfcheck_auto_enabled: bool = False
+    selfcheck_interval_minutes: int = 15
+    selfcheck_mode: str = "quick"
+    circuit_breaker_enabled: bool = True
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_cooldown_seconds: int = 180
+    circuit_breaker_probe_interval_seconds: int = 30
 
     # 日志配置
     log_level: str = "INFO"

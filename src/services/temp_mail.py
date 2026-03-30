@@ -71,6 +71,74 @@ class TempMailService(BaseEmailService):
         self._email_cache: Dict[str, Dict[str, Any]] = {}
         # 记录每个邮箱上一次成功使用的邮件 ID，避免重复使用旧验证码
         self._last_used_mail_ids: Dict[str, str] = {}
+        # /admin/mails 接口对 limit 参数较严格，这里统一限制上限，避免 400 Invalid limit
+        self._admin_mails_limit_max = 50
+
+    def _normalize_admin_limit(self, value: Any, default: int = 50) -> int:
+        try:
+            number = int(value)
+        except Exception:
+            number = int(default)
+        if number <= 0:
+            number = int(default)
+        return max(1, min(number, int(self._admin_mails_limit_max)))
+
+    def _normalize_offset(self, value: Any, default: int = 0) -> int:
+        try:
+            number = int(value)
+        except Exception:
+            number = int(default)
+        return max(0, number)
+
+    def _request_admin_mails_with_limit_fallback(
+        self,
+        *,
+        offset: int = 0,
+        extra_params: Optional[Dict[str, Any]] = None,
+        preferred_limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        /admin/mails 在不同部署版本对 limit 校验不一致。
+        这里按降级 limit 自动重试，避免直接报 400 Invalid limit。
+        """
+        offset_value = self._normalize_offset(offset, default=0)
+        base_params: Dict[str, Any] = dict(extra_params or {})
+        candidate_limits: List[int] = []
+        if preferred_limit is not None:
+            candidate_limits.append(self._normalize_admin_limit(preferred_limit, default=50))
+        candidate_limits.extend([50, 40, 30, 20, 10, 5, 1])
+        # 去重且保持顺序
+        seen = set()
+        limits = []
+        for value in candidate_limits:
+            v = int(max(1, value))
+            if v in seen:
+                continue
+            seen.add(v)
+            limits.append(v)
+
+        last_error: Optional[Exception] = None
+        for index, limit_value in enumerate(limits):
+            params = dict(base_params)
+            params["limit"] = limit_value
+            params["offset"] = offset_value
+            try:
+                return self._make_request("GET", "/admin/mails", params=params)
+            except Exception as e:
+                last_error = e
+                err_text = str(e).lower()
+                retryable_invalid_limit = ("invalid limit" in err_text) and (index < len(limits) - 1)
+                if retryable_invalid_limit:
+                    logger.debug(
+                        "TempMail /admin/mails limit=%s 不可用，降级重试下一档",
+                        limit_value,
+                    )
+                    continue
+                raise
+
+        if last_error:
+            raise last_error
+        raise EmailServiceError("admin mails request failed")
 
     def _decode_mime_header(self, value: str) -> str:
         """解码 MIME 头，兼容 RFC 2047 编码主题。"""
@@ -178,8 +246,8 @@ class TempMailService(BaseEmailService):
             return False
 
         otp_keywords = (
-            "verification",
             "verification code",
+            "verification",
             "verify",
             "one-time code",
             "one time code",
@@ -286,6 +354,7 @@ class TempMailService(BaseEmailService):
         4) /admin/mails (不过滤，客户端二次筛选)
         """
         attempts: List[Dict[str, Any]] = []
+        admin_limit = self._normalize_admin_limit(self.config.get("admin_mails_limit", 50), default=50)
         if jwt:
             attempts.extend([
                 {
@@ -308,33 +377,45 @@ class TempMailService(BaseEmailService):
 
         attempts.append({
             "path": "/admin/mails",
-            "params": {"limit": 80, "offset": 0, "address": email},
+            "params": {"limit": admin_limit, "offset": 0, "address": email},
             "headers": {"Accept": "application/json"},
         })
         if email_id and email_id != email:
             attempts.append({
                 "path": "/admin/mails",
-                "params": {"limit": 80, "offset": 0, "address": email_id},
+                "params": {"limit": admin_limit, "offset": 0, "address": email_id},
                 "headers": {"Accept": "application/json"},
             })
         attempts.append({
             "path": "/admin/mails",
-            "params": {"limit": 120, "offset": 0},
+            "params": {"limit": admin_limit, "offset": 0},
             "headers": {"Accept": "application/json"},
         })
 
         for attempt in attempts:
             path = attempt["path"]
             try:
-                response = self._make_request(
-                    "GET",
-                    path,
-                    params=attempt["params"],
-                    headers=attempt["headers"],
-                )
+                if path == "/admin/mails":
+                    raw_params = dict(attempt["params"] or {})
+                    preferred_limit = raw_params.pop("limit", admin_limit)
+                    offset = raw_params.pop("offset", 0)
+                    response = self._request_admin_mails_with_limit_fallback(
+                        offset=offset,
+                        extra_params=raw_params,
+                        preferred_limit=preferred_limit,
+                    )
+                else:
+                    response = self._make_request(
+                        "GET",
+                        path,
+                        params=attempt["params"],
+                        headers=attempt["headers"],
+                    )
                 mails = self._extract_mails_from_response(response)
                 if mails and "address" not in attempt["params"]:
-                    mails = [mail for mail in mails if self._mail_appears_for_email(mail, email)]
+                    original_mails = list(mails)
+                    filtered_mails = [mail for mail in mails if self._mail_appears_for_email(mail, email)]
+                    mails = filtered_mails or original_mails
                 if mails:
                     return mails
                 logger.debug(f"TempMail 接口 {path} 返回无可用邮件列表: {response}")
@@ -769,7 +850,7 @@ class TempMailService(BaseEmailService):
         logger.warning(f"等待 TempMail 验证码超时: {email}")
         return None
 
-    def list_emails(self, limit: int = 100, offset: int = 0, **kwargs) -> List[Dict[str, Any]]:
+    def list_emails(self, limit: int = 50, offset: int = 0, **kwargs) -> List[Dict[str, Any]]:
         """
         列出邮箱
 
@@ -781,14 +862,18 @@ class TempMailService(BaseEmailService):
         Returns:
             邮箱列表
         """
-        params = {
-            "limit": limit,
-            "offset": offset,
-        }
-        params.update({k: v for k, v in kwargs.items() if v is not None})
+        params = {k: v for k, v in kwargs.items() if v is not None}
+        raw_limit = params.pop("limit", limit)
+        raw_offset = params.pop("offset", offset)
+        params["limit"] = self._normalize_admin_limit(raw_limit, default=50)
+        params["offset"] = self._normalize_offset(raw_offset, default=0)
 
         try:
-            response = self._make_request("GET", "/admin/mails", params=params)
+            response = self._request_admin_mails_with_limit_fallback(
+                offset=params["offset"],
+                extra_params={k: v for k, v in params.items() if k not in ("limit", "offset")},
+                preferred_limit=params["limit"],
+            )
             mails = response.get("results", [])
             if not isinstance(mails, list):
                 raise EmailServiceError(f"API 返回数据格式错误: {response}")

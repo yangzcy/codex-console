@@ -2,7 +2,7 @@
 数据库模块
 """
 
-from .models import Base, Account, EmailService, RegistrationTask, RegistrationBatch, Setting
+from .models import Base, Account, EmailService, RegistrationTask, RegistrationBatch, Setting, SelfCheckRun
 from .session import get_db, init_database, get_session_manager, DatabaseSessionManager
 from . import crud
 
@@ -13,6 +13,7 @@ __all__ = [
     'RegistrationTask',
     'RegistrationBatch',
     'Setting',
+    'SelfCheckRun',
     'get_db',
     'init_database',
     'get_session_manager',

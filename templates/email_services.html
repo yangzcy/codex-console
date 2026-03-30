@@ -8,7 +8,6 @@
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📧</text></svg>">
 </head>
 <body>
-    {% include "partials/site_notice.html" %}
     <div class="container">
         <!-- 导航栏 -->
         <nav class="navbar">
@@ -18,18 +17,18 @@
             <div class="nav-links">
                 <a href="/" class="nav-link">注册</a>
                 <a href="/accounts" class="nav-link">账号管理</a>
-                <a href="/accounts-overview" class="nav-link">账号总览</a>
                 <a href="/email-services" class="nav-link active">邮箱服务</a>
                 <a href="/payment" class="nav-link">支付</a>
                 <a href="/card-pool" class="nav-link">卡池</a>
-                <a href="/auto-team" class="nav-link">自动进team</a>
+                <a href="/auto-team" class="nav-link">team</a>
                 <a href="/logs" class="nav-link">后台日志</a>
                 <a href="/settings" class="nav-link">设置</a>
                 <a href="/logout" class="nav-link">退出</a>
             </div>
-            <button class="theme-toggle" onclick="theme.toggle()" title="切换主题">
-                🌙
-            </button>
+                        <div class="nav-actions">
+            <a href="/selfcheck" class="selfcheck-toggle" title="系统自检">⚙️</a>
+            <button class="theme-toggle" onclick="theme.toggle()" title="切换主题">🌙</button>
+        </div>
         </nav>
 
         <!-- 主内容区 -->
@@ -98,7 +97,7 @@
                 </div>
             </div>
 
-            <!-- 自定义邮箱管理（含 MoeMail / TempMail / DuckMail） -->
+            <!-- 自定义邮箱管理（含 MoeMail / TempMail / CloudMail / DuckMail） -->
             <div class="card custom-email-services-card">
                 <div class="card-header">
                     <h3>🔗 自定义邮箱服务</h3>
@@ -113,6 +112,7 @@
                                     <th>名称</th>
                                     <th style="width: 90px;">类型</th>
                                     <th style="width: 400px;">地址</th>
+                                    <th style="width: 120px;">注册状态</th>
                                     <th style="width: 100px;">状态</th>
                                     <th style="width: 80px;">优先级</th>
                                     <th style="width: 160px;">最后使用</th>
@@ -121,7 +121,7 @@
                             </thead>
                             <tbody id="custom-services-table">
                                 <tr>
-                                    <td colspan="8">
+                                    <td colspan="9">
                                         <div class="empty-state">
                                             <div class="skeleton skeleton-text"></div>
                                             <div class="skeleton skeleton-text" style="width: 80%;"></div>
@@ -148,6 +148,7 @@
                                     <th style="width: 40px;"><input type="checkbox" id="select-all-outlook"></th>
                                     <th>邮箱</th>
                                     <th style="width: 100px;">认证方式</th>
+                                    <th style="width: 120px;">注册状态</th>
                                     <th style="width: 100px;">状态</th>
                                     <th style="width: 80px;">优先级</th>
                                     <th style="width: 160px;">最后使用</th>
@@ -156,7 +157,7 @@
                             </thead>
                             <tbody id="outlook-accounts-table">
                                 <tr>
-                                    <td colspan="7">
+                                    <td colspan="8">
                                         <div class="empty-state">
                                             <div class="skeleton skeleton-text"></div>
                                             <div class="skeleton skeleton-text" style="width: 80%;"></div>
@@ -214,6 +215,7 @@
                         <select id="custom-sub-type" name="sub_type">
                             <option value="moemail">MoeMail（自定义域名 API）</option>
                             <option value="tempmail">TempMail（自部署 Cloudflare Worker）</option>
+                            <option value="cloudmail">CloudMail（自部署 Cloudflare Worker）</option>
                             <option value="duckmail">DuckMail（DuckMail API）</option>
                             <option value="freemail">Freemail（自部署 Cloudflare Worker）</option>
                             <option value="cloudmail">CloudMail（Cloudflare Workers 邮箱）</option>
@@ -571,3 +573,10 @@
     <script src="/static/js/email_services.js?v={{ static_version }}"></script>
 </body>
 </html>
+
+
+
+
+
+
+
