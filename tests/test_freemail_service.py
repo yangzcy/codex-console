@@ -212,3 +212,20 @@ def test_get_verification_code_skips_last_consumed_mail_across_stages():
 
     assert code_1 == "111111"
     assert code_2 == "222222"
+
+
+def test_resolve_domain_index_uses_round_robin_for_multiple_domains():
+    service = FreemailService({
+        "base_url": "https://mail.example.com",
+        "admin_token": "token-123",
+        "domain": ["b.example.com", "a.example.com"],
+    })
+    service._domains = ["a.example.com", "b.example.com", "c.example.com"]
+
+    first = service._resolve_domain_index()
+    second = service._resolve_domain_index()
+    third = service._resolve_domain_index()
+
+    assert first == 0
+    assert second == 1
+    assert third == 0

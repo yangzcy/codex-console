@@ -249,7 +249,7 @@ async def get_email_services_stats():
                 stats['imap_mail_count'] = count
             elif service_type == 'yyds_mail':
                 stats['yyds_mail_count'] = count
-            elif service_type == 'cloudmail':
+            elif service_type in ('cloudmail', 'cloud_mail'):
                 stats['cloudmail_count'] = count
 
         return stats

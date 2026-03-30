@@ -290,7 +290,7 @@ class BatchRegistrationRequest(BaseModel):
 
         count = int(value)
         if count < 1:
-            raise ValueError("注册数量必须大于 0")
+            raise ValueError("注册数量必须是正整数")
         return count
 
 
@@ -912,8 +912,6 @@ async def run_registration_task(task_uuid: str, email_service_type: str, proxy: 
             tm_service_ids or [],
             batch_wait_slice_seconds,
             registration_type,
-            batch_wait_slice_seconds,
-            registration_type,
         )
     except Exception as e:
         logger.error(f"线程池执行异常: {task_uuid}, 错误: {e}")
@@ -1315,6 +1313,7 @@ async def start_registration(
         request.sub2api_service_ids,
         request.auto_upload_tm,
         request.tm_service_ids,
+        None,
         request.registration_type,
     )
 

@@ -150,6 +150,8 @@ class FreemailService(BaseEmailService):
 
         # 缓存 domain 列表
         self._domains = []
+        # 记录轮询位置，按候选域名集合分别推进
+        self._domain_round_robin_offsets: Dict[str, int] = {}
         # 按 OTP 阶段缓存已消费邮件，避免重试时反复捡回旧邮件
         self._stage_seen_mail_ids: Dict[str, set] = {}
         # 跨阶段记录最近一次真正消费过的邮件，避免登录阶段再次捡到注册阶段旧邮件
@@ -233,7 +235,10 @@ class FreemailService(BaseEmailService):
         if not matched:
             matched = self._domains
 
-        target_domain = random.choice(matched)
+        rotation_key = ",".join(matched)
+        next_offset = self._domain_round_robin_offsets.get(rotation_key, 0)
+        target_domain = matched[next_offset % len(matched)]
+        self._domain_round_robin_offsets[rotation_key] = (next_offset + 1) % len(matched)
         return self._domains.index(target_domain)
 
     def create_email(self, config: Dict[str, Any] = None) -> Dict[str, Any]:

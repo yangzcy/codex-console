@@ -257,6 +257,20 @@ document.addEventListener('DOMContentLoaded', () => {
     initVisibilityReconnect();
     restoreActiveTask();
     initAutoUploadOptions();
+    if (elements.batchCount) {
+        const validateBatchCount = () => {
+            const raw = String(elements.batchCount.value || '').trim();
+            if (!raw || !/^[1-9]\d*$/.test(raw)) {
+                elements.batchCount.setCustomValidity('请输入正整数');
+                return;
+            }
+            elements.batchCount.value = raw;
+            elements.batchCount.setCustomValidity('');
+        };
+        elements.batchCount.addEventListener('input', validateBatchCount);
+        elements.batchCount.addEventListener('blur', validateBatchCount);
+        validateBatchCount();
+    }
 });
 
 // 初始化注册后自动操作选项（CPA / Sub2API / TM）
@@ -872,9 +886,12 @@ async function handleBatchRegistration(requestData) {
     if (!/^[1-9]\d*$/.test(countRaw)) {
         addLog('error', '[错误] 注册数量必须是正整数');
         toast.error('注册数量必须是正整数');
+        elements.batchCount?.setCustomValidity('请输入正整数');
+        elements.batchCount?.reportValidity();
         resetButtons();
         return;
     }
+    elements.batchCount?.setCustomValidity('');
     const count = parseInt(countRaw, 10);
     const intervalMin = parseInt(elements.intervalMin.value) || 5;
     const intervalMax = parseInt(elements.intervalMax.value) || 30;
