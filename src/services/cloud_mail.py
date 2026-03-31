@@ -335,22 +335,10 @@ class CloudMailService(BaseEmailService):
                 return proven_domains
 
             # 冷启动阶段：健康池被清空后，先只放一个引导域名做 canary。
-            # 这里优先取配置里的最后一个域名，避免一上来并发试探多个新域名，先跑出 proven 再扩散。
+            # 这里优先取配置里的最后一个域名，且在出现 proven 域名前不放行其他新域名，
+            # 避免首批并发把 maia/maib/maic 之类探索域名先打出失败。
             bootstrap_order = self._bootstrap_domain_order(configured_domains, ordered)
             bootstrap_domain = bootstrap_order[0] if bootstrap_order else ordered[0]
-            bootstrap_inflight = self._get_domain_inflight_count(base_url, bootstrap_domain)
-            if bootstrap_inflight <= 0:
-                return [bootstrap_domain]
-
-            # 引导域名已有在途任务时，只允许其余域名各保留 1 个探测位。
-            # 这样最差也只是缓慢探索，不会在冷启动时瞬间打穿所有域名。
-            fallback_domains = [
-                domain
-                for domain in bootstrap_order[1:]
-                if self._get_domain_inflight_count(base_url, domain) <= 0
-            ]
-            if fallback_domains:
-                return fallback_domains[:1]
             return [bootstrap_domain]
         return []
 
