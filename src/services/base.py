@@ -165,6 +165,28 @@ class BaseEmailService(abc.ABC):
                 return email_info
         return None
 
+    def report_registration_outcome(
+        self,
+        email: str,
+        *,
+        success: bool,
+        error_message: str = "",
+    ) -> None:
+        """
+        回写邮箱/域名在注册链路中的结果（可选实现）。
+
+        默认 no-op，由支持域名健康管理的服务自行覆盖。
+        """
+        return None
+
+    def get_domain_health_snapshot(self) -> Dict[str, Any]:
+        """
+        返回当前邮箱服务的域名可用性/冷却快照（可选实现）。
+
+        默认返回空字典，由支持域名健康管理的服务自行覆盖。
+        """
+        return {}
+
     def wait_for_email(
         self,
         email: str,

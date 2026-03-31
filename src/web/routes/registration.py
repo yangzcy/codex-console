@@ -1107,7 +1107,7 @@ async def run_batch_parallel(
             if status == "deferred":
                 outcome = {
                     "outcome": "failed",
-                    "error": f"验证码等待片段已用尽（{BATCH_OTP_WAIT_MAX_DEFERS} 轮），停止继续排队",
+                    "error": f"任务让出重试次数已用尽（{BATCH_OTP_WAIT_MAX_DEFERS} 轮），停止继续排队",
                     "email": "",
                 }
 
@@ -1223,7 +1223,7 @@ async def run_batch_pipeline(
                 if status == "deferred":
                     outcome = {
                         "outcome": "failed",
-                        "error": f"验证码等待片段已用尽（{BATCH_OTP_WAIT_MAX_DEFERS} 轮），停止继续排队",
+                        "error": f"任务让出重试次数已用尽（{BATCH_OTP_WAIT_MAX_DEFERS} 轮），停止继续排队",
                         "email": "",
                     }
 
