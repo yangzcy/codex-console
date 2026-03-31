@@ -229,3 +229,59 @@ def test_resolve_domain_index_uses_round_robin_for_multiple_domains():
     assert first == 0
     assert second == 1
     assert third == 0
+
+
+def test_report_registration_outcome_success_clears_runtime_cooldown(monkeypatch, tmp_path):
+    health_path = tmp_path / "freemail_domain_health.json"
+    monkeypatch.setattr(FreemailService, "_health_store_path", staticmethod(lambda: health_path))
+    FreemailService._domain_rotation_offsets = {}
+    FreemailService._runtime_domain_block_until = {}
+
+    service = FreemailService({
+        "base_url": "https://mail.example.com",
+        "admin_token": "token-123",
+        "domain": ["a.example.com"],
+    })
+    service._domains = ["a.example.com"]
+
+    service.report_registration_outcome(
+        "tester@a.example.com",
+        success=False,
+        error_message="registration_disallowed",
+    )
+    cooling_snapshot = service.get_domain_health_snapshot()
+    assert cooling_snapshot["available_domains"] == []
+    assert cooling_snapshot["cooldown_domains"][0]["domain"] == "a.example.com"
+
+    service.report_registration_outcome("tester@a.example.com", success=True)
+
+    snapshot = service.get_domain_health_snapshot()
+    assert snapshot["available_domains"] == ["a.example.com"]
+    assert snapshot["cooldown_domains"] == []
+    assert snapshot["domain_states"]["a.example.com"]["is_cooling"] is False
+
+
+def test_create_email_falls_back_to_next_candidate_and_records_domain_failure(monkeypatch, tmp_path):
+    health_path = tmp_path / "freemail_domain_health.json"
+    monkeypatch.setattr(FreemailService, "_health_store_path", staticmethod(lambda: health_path))
+    FreemailService._domain_rotation_offsets = {}
+    FreemailService._runtime_domain_block_until = {}
+
+    service = FreemailService({
+        "base_url": "https://mail.example.com",
+        "admin_token": "token-123",
+        "domain": ["a.example.com", "b.example.com"],
+    })
+    service._domains = ["a.example.com", "b.example.com"]
+    service.http_client = FakeHTTPClient([
+        FakeResponse(status_code=500, payload={"error": "boom"}, text='{"error":"boom"}'),
+        FakeResponse(payload={"email": "tester@b.example.com"}),
+    ])
+
+    result = service.create_email()
+    snapshot = service.get_domain_health_snapshot()
+
+    assert result["email"] == "tester@b.example.com"
+    assert [call["kwargs"].get("params", {}).get("domainIndex") for call in service.http_client.calls] == [0, 1]
+    assert snapshot["domain_states"]["a.example.com"]["fail_count"] == 1
+    assert snapshot["domain_states"]["a.example.com"]["last_outcome"] == "mailbox_create_failed"

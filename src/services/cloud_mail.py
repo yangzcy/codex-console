@@ -62,9 +62,14 @@ class CloudMailService(BaseEmailService):
             "timeout": 30,
             "max_retries": 3,
             "proxy_url": None,
+            "exploratory_probe_slots": 2,
         }
         self.config = {**default_config, **(config or {})}
         self.config["base_url"] = self.config["base_url"].rstrip("/")
+        try:
+            self.config["exploratory_probe_slots"] = max(0, int(self.config.get("exploratory_probe_slots", 2)))
+        except (TypeError, ValueError):
+            self.config["exploratory_probe_slots"] = 2
 
         # 创建 requests session
         self.session = requests.Session()
@@ -324,14 +329,15 @@ class CloudMailService(BaseEmailService):
 
             if proven_domains:
                 # 有已验证成功域名时，优先把流量压给 proven 域名。
-                # exploratory 只保留一个“未被占用”的探测位，避免多个新坏域名同时消耗额度。
+                # exploratory 仅放行少量“未被占用”的探测位，控制坏域名试探成本。
                 available_exploratory = [
                     domain
                     for domain in exploratory_domains
                     if self._get_domain_inflight_count(base_url, domain) <= 0
                 ]
+                probe_slots = max(0, int(self.config.get("exploratory_probe_slots") or 0))
                 if available_exploratory:
-                    return proven_domains + available_exploratory[:1]
+                    return proven_domains + available_exploratory[:probe_slots]
                 return proven_domains
 
             # 冷启动阶段：健康池被清空后，先只放一个引导域名做 canary。
@@ -429,6 +435,7 @@ class CloudMailService(BaseEmailService):
                 state["consecutive_strong_failures"] = 0
                 state["register_create_account_retryable_count"] = 0
                 state["cooldown_until"] = 0
+                CloudMailService._runtime_domain_block_until.pop(f"{base_url}::{domain}", None)
                 self._save_domain_health(payload)
                 return
 

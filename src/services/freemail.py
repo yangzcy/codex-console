@@ -8,9 +8,11 @@ import time
 import logging
 import random
 import string
+import json
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
+from pathlib import Path
 
 from .base import BaseEmailService, EmailServiceError, EmailServiceType
 from ..core.http_client import HTTPClient, RequestConfig
@@ -114,6 +116,11 @@ class FreemailService(BaseEmailService):
     基于自部署 Cloudflare Worker 的临时邮箱
     """
 
+    _domain_health_lock = None
+    _domain_create_lock = None
+    _domain_rotation_offsets: Dict[str, int] = {}
+    _runtime_domain_block_until: Dict[str, float] = {}
+
     def __init__(self, config: Dict[str, Any] = None, name: str = None):
         """
         初始化 Freemail 服务
@@ -137,10 +144,15 @@ class FreemailService(BaseEmailService):
         default_config = {
             "timeout": 30,
             "max_retries": 3,
+            "exploratory_probe_slots": 2,
         }
         self.config = {**default_config, **(config or {})}
         self.config["base_url"] = self.config["base_url"].rstrip("/")
         self.config["domain"] = _normalize_domain_list(self.config.get("domain"))
+        try:
+            self.config["exploratory_probe_slots"] = max(0, int(self.config.get("exploratory_probe_slots", 2)))
+        except (TypeError, ValueError):
+            self.config["exploratory_probe_slots"] = 2
 
         http_config = RequestConfig(
             timeout=self.config["timeout"],
@@ -148,14 +160,288 @@ class FreemailService(BaseEmailService):
         )
         self.http_client = HTTPClient(proxy_url=None, config=http_config)
 
+        if FreemailService._domain_health_lock is None:
+            import threading
+            FreemailService._domain_health_lock = threading.Lock()
+        if FreemailService._domain_create_lock is None:
+            import threading
+            FreemailService._domain_create_lock = threading.Lock()
+
         # 缓存 domain 列表
         self._domains = []
-        # 记录轮询位置，按候选域名集合分别推进
-        self._domain_round_robin_offsets: Dict[str, int] = {}
         # 按 OTP 阶段缓存已消费邮件，避免重试时反复捡回旧邮件
         self._stage_seen_mail_ids: Dict[str, set] = {}
         # 跨阶段记录最近一次真正消费过的邮件，避免登录阶段再次捡到注册阶段旧邮件
         self._last_used_mail_ids: Dict[str, str] = {}
+
+    @staticmethod
+    def _health_store_path() -> Path:
+        app_root = Path(__file__).resolve().parents[2]
+        data_dir = app_root / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return data_dir / "freemail_domain_health.json"
+
+    @classmethod
+    def _load_domain_health(cls) -> Dict[str, Any]:
+        path = cls._health_store_path()
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("读取 Freemail 域名健康池失败: %s", exc)
+            return {}
+
+    @classmethod
+    def _save_domain_health(cls, payload: Dict[str, Any]) -> None:
+        path = cls._health_store_path()
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+
+    def _health_bucket_key(self) -> str:
+        return str(self.config.get("base_url") or "").strip().lower()
+
+    def _collect_domain_health_snapshot(self, requested_domain: Any = None) -> Dict[str, Any]:
+        self._ensure_domains()
+        configured_domains = _normalize_domain_list(
+            requested_domain if requested_domain not in (None, "") else self.config.get("domain")
+        )
+        runtime_domains = list(self._domains or [])
+        domain_list = configured_domains or runtime_domains
+        if runtime_domains:
+            domain_list = [domain for domain in runtime_domains if not configured_domains or domain in configured_domains]
+        domain_list = domain_list or configured_domains or runtime_domains
+
+        bucket_key = self._health_bucket_key()
+        now_ts = time.time()
+
+        with FreemailService._domain_health_lock:
+            payload = self._load_domain_health()
+            bucket = payload.setdefault(bucket_key, {"domains": {}})
+            states = bucket.setdefault("domains", {})
+
+            available_domains: List[str] = []
+            cooldown_domains: List[Dict[str, Any]] = []
+            domain_states: Dict[str, Dict[str, Any]] = {}
+
+            for domain in domain_list:
+                state = states.setdefault(domain, {})
+                persisted_until = float(state.get("cooldown_until") or 0.0)
+                runtime_until = float(FreemailService._runtime_domain_block_until.get(f"{bucket_key}::{domain}") or 0.0)
+                cooldown_until = max(persisted_until, runtime_until)
+                item = {
+                    "success_count": int(state.get("success_count") or 0),
+                    "fail_count": int(state.get("fail_count") or 0),
+                    "consecutive_failures": int(state.get("consecutive_failures") or 0),
+                    "register_create_account_retryable_count": int(
+                        state.get("register_create_account_retryable_count") or 0
+                    ),
+                    "last_error": str(state.get("last_error") or "").strip(),
+                    "last_outcome": str(state.get("last_outcome") or "").strip(),
+                    "cooldown_until": cooldown_until,
+                    "is_proven": int(state.get("success_count") or 0) > 0,
+                    "is_cooling": cooldown_until > now_ts,
+                }
+                domain_states[domain] = item
+                if cooldown_until > now_ts:
+                    cooldown_domains.append(
+                        {
+                            "domain": domain,
+                            "cooldown_until": cooldown_until,
+                            "cooldown_until_iso": datetime.fromtimestamp(cooldown_until).isoformat(),
+                            "remaining_seconds": max(0, int(cooldown_until - now_ts)),
+                            "last_error": item["last_error"],
+                            "last_outcome": item["last_outcome"],
+                        }
+                    )
+                else:
+                    available_domains.append(domain)
+
+            self._save_domain_health(payload)
+
+        cooldown_domains.sort(key=lambda item: (item.get("cooldown_until") or 0.0, item.get("domain") or ""))
+        return {
+            "service_type": self.service_type.value,
+            "base_url": bucket_key,
+            "configured_domains": domain_list,
+            "available_domains": available_domains,
+            "cooldown_domains": cooldown_domains,
+            "has_available_domains": bool(available_domains),
+            "domain_states": domain_states,
+        }
+
+    @staticmethod
+    def _domain_priority_key(state: Dict[str, Any]) -> tuple:
+        success_count = int(state.get("success_count") or 0)
+        consecutive_failures = int(state.get("consecutive_failures") or 0)
+        fail_count = int(state.get("fail_count") or 0)
+        retryable_count = int(state.get("register_create_account_retryable_count") or 0)
+        updated_at = str(state.get("updated_at") or "")
+        is_proven = 1 if success_count > 0 else 0
+        return (
+            -is_proven,
+            -success_count,
+            consecutive_failures,
+            retryable_count,
+            fail_count,
+            updated_at,
+        )
+
+    def _get_candidate_domains(self, requested_domain: Any = None) -> List[str]:
+        snapshot = self._collect_domain_health_snapshot(requested_domain)
+        configured_domains = list(snapshot.get("configured_domains") or [])
+        if not configured_domains:
+            return []
+        healthy_domains = list(snapshot.get("available_domains") or [])
+        if not healthy_domains:
+            return []
+
+        bucket_key = self._health_bucket_key()
+        with FreemailService._domain_health_lock:
+            payload = self._load_domain_health()
+            bucket = payload.setdefault(bucket_key, {"domains": {}})
+            states = bucket.setdefault("domains", {})
+            ordered = sorted(
+                healthy_domains,
+                key=lambda domain: self._domain_priority_key(states.get(domain, {})),
+            )
+            self._save_domain_health(payload)
+
+        proven_domains = [d for d in ordered if int(states.get(d, {}).get("success_count") or 0) > 0]
+        exploratory_domains = [d for d in ordered if d not in proven_domains]
+
+        if proven_domains:
+            if exploratory_domains:
+                rotation_key = f"{bucket_key}::{','.join(exploratory_domains)}"
+                next_offset = FreemailService._domain_rotation_offsets.get(rotation_key, 0)
+                probe_slots = max(0, int(self.config.get("exploratory_probe_slots") or 0))
+                if probe_slots <= 0:
+                    return proven_domains
+                rotated = exploratory_domains[next_offset:] + exploratory_domains[:next_offset]
+                probes = rotated[:probe_slots]
+                FreemailService._domain_rotation_offsets[rotation_key] = (next_offset + 1) % len(exploratory_domains)
+                return proven_domains + probes
+            return proven_domains
+
+        rotation_key = f"{bucket_key}::{','.join(ordered)}"
+        next_offset = FreemailService._domain_rotation_offsets.get(rotation_key, 0)
+        rotated = ordered[next_offset:] + ordered[:next_offset]
+        FreemailService._domain_rotation_offsets[rotation_key] = (next_offset + 1) % len(ordered)
+        return rotated
+
+    def _cooldown_domain(self, domain: str, *, outcome: str, cooldown_seconds: int, error_message: str) -> None:
+        bucket_key = self._health_bucket_key()
+        now_ts = time.time()
+        now_iso = datetime.now().isoformat()
+        with FreemailService._domain_health_lock:
+            payload = self._load_domain_health()
+            bucket = payload.setdefault(bucket_key, {"domains": {}})
+            state = bucket.setdefault("domains", {}).setdefault(domain, {})
+            state["updated_at"] = now_iso
+            state["last_error"] = str(error_message or "").strip()
+            state["last_outcome"] = outcome
+            state["fail_count"] = int(state.get("fail_count") or 0) + 1
+            state["consecutive_failures"] = int(state.get("consecutive_failures") or 0) + 1
+            state["cooldown_until"] = max(float(state.get("cooldown_until") or 0.0), now_ts + max(0, cooldown_seconds))
+            FreemailService._runtime_domain_block_until[f"{bucket_key}::{domain}"] = state["cooldown_until"]
+            self._save_domain_health(payload)
+        logger.warning("Freemail 域名进入冷却: %s, outcome=%s, cooldown=%ss", domain, outcome, cooldown_seconds)
+
+    @staticmethod
+    def _classify_domain_error(error_message: str) -> str:
+        text = str(error_message or "").strip().lower()
+        if not text:
+            return "success"
+        if "registration_disallowed" in text or "cannot create your account with the given information" in text:
+            return "domain_blocked"
+        if "failed to create account. please try again." in text:
+            return "register_create_account_retryable"
+        if "等待验证码超时" in text or "验证验证码失败" in text:
+            return "otp_timeout"
+        if "创建邮箱失败" in text:
+            return "mailbox_create_failed"
+        if "http 503" in text or "http 429" in text:
+            return "upstream_transient"
+        return "other"
+
+    def report_registration_outcome(
+        self,
+        email: str,
+        *,
+        success: bool,
+        error_message: str = "",
+    ) -> None:
+        email_text = str(email or "").strip().lower()
+        if "@" not in email_text:
+            return
+        domain = email_text.split("@", 1)[1].strip()
+        if not domain:
+            return
+
+        bucket_key = self._health_bucket_key()
+        outcome = self._classify_domain_error(error_message)
+        now_ts = time.time()
+        now_iso = datetime.now().isoformat()
+
+        with FreemailService._domain_health_lock:
+            payload = self._load_domain_health()
+            bucket = payload.setdefault(bucket_key, {"domains": {}})
+            state = bucket.setdefault("domains", {}).setdefault(domain, {})
+            state["updated_at"] = now_iso
+            state["last_error"] = str(error_message or "").strip()
+            state["last_outcome"] = outcome
+
+            if success:
+                state["success_count"] = int(state.get("success_count") or 0) + 1
+                state["consecutive_failures"] = 0
+                state["register_create_account_retryable_count"] = 0
+                state["cooldown_until"] = 0
+                FreemailService._runtime_domain_block_until.pop(f"{bucket_key}::{domain}", None)
+                self._save_domain_health(payload)
+                return
+
+            if outcome == "upstream_transient":
+                self._save_domain_health(payload)
+                return
+
+            state["fail_count"] = int(state.get("fail_count") or 0) + 1
+            state["consecutive_failures"] = int(state.get("consecutive_failures") or 0) + 1
+
+            cooldown_seconds = 0
+            if outcome == "domain_blocked":
+                cooldown_seconds = 12 * 3600
+            elif outcome == "otp_timeout":
+                if int(state.get("consecutive_failures") or 0) >= 3:
+                    cooldown_seconds = 30 * 60
+            elif outcome == "mailbox_create_failed":
+                if int(state.get("consecutive_failures") or 0) >= 3:
+                    cooldown_seconds = 15 * 60
+            elif outcome == "register_create_account_retryable":
+                state["register_create_account_retryable_count"] = int(
+                    state.get("register_create_account_retryable_count") or 0
+                ) + 1
+                success_count = int(state.get("success_count") or 0)
+                consecutive_failures = int(state.get("consecutive_failures") or 0)
+                retryable_count = int(state.get("register_create_account_retryable_count") or 0)
+                if success_count <= 0:
+                    if consecutive_failures >= 2:
+                        cooldown_seconds = 30 * 60
+                    if retryable_count >= 4:
+                        cooldown_seconds = max(cooldown_seconds, 12 * 3600)
+                else:
+                    if consecutive_failures >= 3:
+                        cooldown_seconds = 15 * 60
+                    elif consecutive_failures >= 2:
+                        cooldown_seconds = 5 * 60
+
+            if cooldown_seconds > 0:
+                state["cooldown_until"] = max(float(state.get("cooldown_until") or 0.0), now_ts + cooldown_seconds)
+                FreemailService._runtime_domain_block_until[f"{bucket_key}::{domain}"] = state["cooldown_until"]
+            self._save_domain_health(payload)
+
+    def get_domain_health_snapshot(self) -> Dict[str, Any]:
+        return self._collect_domain_health_snapshot()
 
     def _get_headers(self) -> Dict[str, str]:
         """构造 admin 请求头"""
@@ -236,9 +522,9 @@ class FreemailService(BaseEmailService):
             matched = self._domains
 
         rotation_key = ",".join(matched)
-        next_offset = self._domain_round_robin_offsets.get(rotation_key, 0)
+        next_offset = FreemailService._domain_rotation_offsets.get(rotation_key, 0)
         target_domain = matched[next_offset % len(matched)]
-        self._domain_round_robin_offsets[rotation_key] = (next_offset + 1) % len(matched)
+        FreemailService._domain_rotation_offsets[rotation_key] = (next_offset + 1) % len(matched)
         return self._domains.index(target_domain)
 
     def create_email(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -251,43 +537,84 @@ class FreemailService(BaseEmailService):
             - service_id: 同 email（用作标识）
         """
         req_config = config or {}
-        domain_index = self._resolve_domain_index(req_config.get("domain"))
-                    
         prefix = req_config.get("name")
-        try:
-            if prefix:
-                body = {
-                    "local": prefix,
-                    "domainIndex": domain_index
-                }
-                resp = self._make_request("POST", "/api/create", json=body)
-            else:
-                params = {"domainIndex": domain_index}
-                length = req_config.get("length")
-                if length:
-                    params["length"] = length
-                resp = self._make_request("GET", "/api/generate", params=params)
+        specified_domain = req_config.get("domain")
 
-            email = resp.get("email")
-            if not email:
-                raise EmailServiceError(f"创建邮箱失败，未返回邮箱地址: {resp}")
+        with FreemailService._domain_create_lock:
+            self._ensure_domains()
+            candidate_domains = self._get_candidate_domains(specified_domain)
+            if not candidate_domains:
+                snapshot = self._collect_domain_health_snapshot(specified_domain)
+                cooldown_domains = list(snapshot.get("cooldown_domains") or [])
+                if cooldown_domains:
+                    cooldown_summary = ", ".join(
+                        f"{item['domain']}({item['remaining_seconds']}s,{item['last_outcome'] or 'cooling'})"
+                        for item in cooldown_domains
+                    )
+                    raise EmailServiceError(
+                        "当前无可用邮箱域名，以下域名正在冷却中不可用: "
+                        f"{cooldown_summary}"
+                    )
+                raise EmailServiceError("当前无可用邮箱域名")
 
-            email_info = {
-                "email": email,
-                "service_id": email,
-                "id": email,
-                "created_at": time.time(),
-            }
+            last_error: Optional[Exception] = None
+            for idx, selected_domain in enumerate(candidate_domains, start=1):
+                try:
+                    if self._domains and selected_domain in self._domains:
+                        domain_index = self._domains.index(selected_domain)
+                    else:
+                        domain_index = self._resolve_domain_index(selected_domain)
 
-            logger.info(f"成功创建 Freemail 邮箱: {email}")
-            self.update_status(True)
-            return email_info
+                    if prefix:
+                        body = {
+                            "local": prefix,
+                            "domainIndex": domain_index
+                        }
+                        resp = self._make_request("POST", "/api/create", json=body)
+                    else:
+                        params = {"domainIndex": domain_index}
+                        length = req_config.get("length")
+                        if length:
+                            params["length"] = length
+                        resp = self._make_request("GET", "/api/generate", params=params)
 
-        except Exception as e:
-            self.update_status(False, e)
-            if isinstance(e, EmailServiceError):
-                raise
-            raise EmailServiceError(f"创建邮箱失败: {e}")
+                    email = resp.get("email")
+                    if not email:
+                        raise EmailServiceError(f"创建邮箱失败，未返回邮箱地址: {resp}")
+
+                    email_info = {
+                        "email": email,
+                        "service_id": email,
+                        "id": email,
+                        "created_at": time.time(),
+                        "domain": selected_domain,
+                        "domain_health_snapshot": self._collect_domain_health_snapshot(specified_domain),
+                    }
+
+                    logger.info(f"成功创建 Freemail 邮箱: {email}")
+                    self.update_status(True)
+                    return email_info
+                except Exception as e:
+                    last_error = e
+                    self.update_status(False, e)
+                    self.report_registration_outcome(
+                        f"probe@{selected_domain}",
+                        success=False,
+                        error_message=f"创建邮箱失败: {e}",
+                    )
+                    if idx < len(candidate_domains):
+                        logger.warning(
+                            "Freemail 使用域名 %s 创建邮箱失败，自动切换下一个域名重试（%s/%s）: %s",
+                            selected_domain,
+                            idx + 1,
+                            len(candidate_domains),
+                            str(e or ""),
+                        )
+                        continue
+
+            if isinstance(last_error, EmailServiceError):
+                raise last_error
+            raise EmailServiceError(f"创建邮箱失败: {last_error}")
 
     def get_verification_code(
         self,
