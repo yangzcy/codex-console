@@ -459,10 +459,10 @@ def _resolve_task_email(task: RegistrationTask) -> Optional[str]:
 def _normalize_email_service_config(
     service_type: EmailServiceType,
     config: Optional[dict],
-    proxy_url: Optional[str] = None
 ) -> dict:
     """按服务类型兼容旧字段名，避免不同服务的配置键互相污染。"""
     normalized = config.copy() if config else {}
+    normalized.pop("proxy_url", None)
 
     if 'api_url' in normalized and 'base_url' not in normalized:
         normalized['base_url'] = normalized.pop('api_url')
@@ -477,9 +477,6 @@ def _normalize_email_service_config(
         if 'domain' in normalized and 'default_domain' not in normalized:
             normalized['default_domain'] = normalized.pop('domain')
 
-    if proxy_url and 'proxy_url' not in normalized:
-        normalized['proxy_url'] = proxy_url
-
     return normalized
 
 
@@ -490,12 +487,71 @@ def _make_task_execution_outcome(outcome: str, error: str = "", email: str = "")
         "email": email,
     }
 
+
+def _classify_proxy_report_reason(error_text: str, outcome: str) -> str:
+    text = str(error_text or "").strip().lower()
+    outcome_key = str(outcome or "").strip().lower()
+    if outcome_key == "completed":
+        return "success"
+    if "http 429" in text or "rate limit exceeded" in text or "too many requests" in text:
+        return "http_429"
+    if "token exchange failed" in text:
+        return "token_exchange_fail"
+    if "处理 oauth 回调失败" in text or "oauth callback" in text:
+        return "oauth_callback_fail"
+    if "failed to connect to auth.openai.com" in text or "auth.openai.com port 443" in text:
+        return "auth_openai_unreachable"
+    if "timed out" in text or "timeout" in text or "curl: (7)" in text:
+        return "connect_timeout"
+    return "unknown_error"
+
+
+def _report_dynamic_proxy_result_if_needed(
+    *,
+    dynamic_proxy_used: bool,
+    proxy_url: Optional[str],
+    task_uuid: str,
+    outcome: str,
+    error_message: str = "",
+) -> None:
+    if not dynamic_proxy_used:
+        return
+    runtime_proxy = str(proxy_url or "").strip()
+    if not runtime_proxy:
+        return
+
+    try:
+        from ...core.dynamic_proxy import report_dynamic_proxy_result
+
+        settings = get_settings()
+        report_url = str(getattr(settings, "proxy_dynamic_report_url", "") or "").strip()
+        if not report_url:
+            return
+
+        api_key = settings.proxy_dynamic_api_key.get_secret_value() if settings.proxy_dynamic_api_key else ""
+        reason = _classify_proxy_report_reason(error_message, outcome)
+        report_dynamic_proxy_result(
+            report_url=report_url,
+            proxy_url=runtime_proxy,
+            task_id=task_uuid,
+            success=(str(outcome).lower() == "completed"),
+            reason=reason,
+            detail=str(error_message or "").strip(),
+            purpose="openai_register",
+            api_key=api_key,
+            api_key_header=settings.proxy_dynamic_api_key_header,
+        )
+    except Exception as exc:
+        logger.warning("任务 %s 动态代理结果上报失败: %s", task_uuid, exc)
+
 def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, batch_wait_slice_seconds: Optional[int] = None, registration_type: str = RoleTag.CHILD.value):
     """
     在线程池中执行的同步注册任务
 
     这个函数会被 run_in_executor 调用，运行在独立线程中
     """
+    openai_proxy_url: Optional[str] = None
+    dynamic_proxy_used = False
     with get_db() as db:
         try:
             # 检查是否已取消
@@ -527,16 +583,22 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
             # 确定使用的代理
             # 如果前端传入了代理参数，使用传入的
             # 否则从代理列表或系统设置中获取
-            actual_proxy_url = proxy
+            openai_proxy_url = proxy
             proxy_id = None
 
-            if not actual_proxy_url:
-                actual_proxy_url, proxy_id = get_proxy_for_registration(db)
-                if actual_proxy_url:
-                    logger.info(f"任务 {task_uuid} 使用代理: {actual_proxy_url[:50]}...")
+            if not openai_proxy_url:
+                openai_proxy_url, proxy_id = get_proxy_for_registration(db)
+                if openai_proxy_url:
+                    logger.info(f"任务 {task_uuid} 使用 OpenAI 代理: {openai_proxy_url[:50]}...")
+                    settings_snapshot = get_settings()
+                    dynamic_proxy_used = (
+                        proxy_id is None
+                        and bool(getattr(settings_snapshot, "proxy_dynamic_enabled", False))
+                        and bool(str(getattr(settings_snapshot, "proxy_dynamic_api_url", "") or "").strip())
+                    )
 
             # 更新任务的代理记录
-            crud.update_registration_task(db, task_uuid, proxy=actual_proxy_url)
+            crud.update_registration_task(db, task_uuid, proxy=openai_proxy_url)
 
             # 创建邮箱服务
             service_type = EmailServiceType(email_service_type)
@@ -552,7 +614,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
 
                 if db_service:
                     service_type = EmailServiceType(db_service.service_type)
-                    config = _normalize_email_service_config(service_type, db_service.config, actual_proxy_url)
+                    config = _normalize_email_service_config(service_type, db_service.config)
                     # 更新任务关联的邮箱服务
                     crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
                     logger.info(f"使用数据库邮箱服务: {db_service.name} (ID: {db_service.id}, 类型: {service_type.value})")
@@ -565,7 +627,6 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         "base_url": settings.tempmail_base_url,
                         "timeout": settings.tempmail_timeout,
                         "max_retries": settings.tempmail_max_retries,
-                        "proxy_url": actual_proxy_url,
                     }
                 elif service_type == EmailServiceType.MOE_MAIL:
                     # 检查数据库中是否有可用的自定义域名服务
@@ -576,14 +637,13 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     ).order_by(EmailServiceModel.priority.asc()).first()
 
                     if db_service and db_service.config:
-                        config = _normalize_email_service_config(service_type, db_service.config, actual_proxy_url)
+                        config = _normalize_email_service_config(service_type, db_service.config)
                         crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
                         logger.info(f"使用数据库自定义域名服务: {db_service.name}")
                     elif settings.custom_domain_base_url and settings.custom_domain_api_key:
                         config = {
                             "base_url": settings.custom_domain_base_url,
                             "api_key": settings.custom_domain_api_key.get_secret_value() if settings.custom_domain_api_key else "",
-                            "proxy_url": actual_proxy_url,
                         }
                     else:
                         raise ValueError("没有可用的自定义域名邮箱服务，请先在设置中配置")
@@ -632,7 +692,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     ).order_by(EmailServiceModel.priority.asc()).first()
 
                     if db_service and db_service.config:
-                        config = _normalize_email_service_config(service_type, db_service.config, actual_proxy_url)
+                        config = _normalize_email_service_config(service_type, db_service.config)
                         crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
                         logger.info(f"使用数据库 DuckMail 服务: {db_service.name}")
                     else:
@@ -646,7 +706,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     ).order_by(EmailServiceModel.priority.asc()).first()
 
                     if db_service and db_service.config:
-                        config = _normalize_email_service_config(service_type, db_service.config, actual_proxy_url)
+                        config = _normalize_email_service_config(service_type, db_service.config)
                         crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
                         logger.info(f"使用数据库 Freemail 服务: {db_service.name}")
                     else:
@@ -660,13 +720,13 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     ).order_by(EmailServiceModel.priority.asc()).first()
 
                     if db_service and db_service.config:
-                        config = _normalize_email_service_config(service_type, db_service.config, actual_proxy_url)
+                        config = _normalize_email_service_config(service_type, db_service.config)
                         crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
                         logger.info(f"使用数据库 IMAP 邮箱服务: {db_service.name}")
                     else:
                         raise ValueError("没有可用的 IMAP 邮箱服务，请先在邮箱服务中添加")
                 else:
-                    config = email_service_config or {}
+                    config = _normalize_email_service_config(service_type, email_service_config)
 
             email_service = EmailServiceFactory.create(service_type, config)
 
@@ -675,7 +735,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
 
             engine = RegistrationEngine(
                 email_service=email_service,
-                proxy_url=actual_proxy_url,
+                proxy_url=openai_proxy_url,
                 callback_logger=log_callback,
                 task_uuid=task_uuid,
                 batch_wait_slice_seconds=batch_wait_slice_seconds,
@@ -806,6 +866,13 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
 
                 # 更新 TaskManager 状态
                 task_manager.update_status(task_uuid, "completed", email=result.email)
+                _report_dynamic_proxy_result_if_needed(
+                    dynamic_proxy_used=dynamic_proxy_used,
+                    proxy_url=openai_proxy_url,
+                    task_uuid=task_uuid,
+                    outcome="completed",
+                    error_message="",
+                )
 
                 logger.info(f"注册任务完成: {task_uuid}, 邮箱: {result.email}")
                 return _make_task_execution_outcome("completed", email=result.email)
@@ -844,6 +911,13 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
 
                 # 更新 TaskManager 状态
                 task_manager.update_status(task_uuid, "failed", error=result.error_message)
+                _report_dynamic_proxy_result_if_needed(
+                    dynamic_proxy_used=dynamic_proxy_used,
+                    proxy_url=openai_proxy_url,
+                    task_uuid=task_uuid,
+                    outcome="failed",
+                    error_message=result.error_message,
+                )
 
                 logger.warning(f"注册任务失败: {task_uuid}, 原因: {result.error_message}")
                 return _make_task_execution_outcome("failed", error=result.error_message)
@@ -872,6 +946,13 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
 
                 # 更新 TaskManager 状态
                 task_manager.update_status(task_uuid, "failed", error=str(e))
+                _report_dynamic_proxy_result_if_needed(
+                    dynamic_proxy_used=dynamic_proxy_used,
+                    proxy_url=openai_proxy_url,
+                    task_uuid=task_uuid,
+                    outcome="failed",
+                    error_message=str(e),
+                )
             except:
                 pass
             return _make_task_execution_outcome("failed", error=str(e))

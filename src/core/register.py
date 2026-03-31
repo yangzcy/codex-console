@@ -268,9 +268,10 @@ class RegistrationEngine:
         normalized_stage = str(stage or "").strip().lower()
         attempt_index = max(0, int(attempt) - 1)
         if normalized_stage in {"login_start", "login_password", "login"}:
-            backoff = (5, 15, 30)
+            # 登录链路的 429 更容易连续触发，拉长退避窗口避免短时间内反复撞限流。
+            backoff = (20, 45, 90)
         else:
-            backoff = (5, 10, 18)
+            backoff = (10, 25, 45)
         return backoff[min(attempt_index, len(backoff) - 1)]
 
     @staticmethod
@@ -278,11 +279,29 @@ class RegistrationEngine:
         text = str(error_text or "").lower()
         return ("429" in text) or ("rate limit" in text) or ("too many requests" in text)
 
+    @staticmethod
+    def _is_transient_service_unavailable(status_code: int, response_text: str) -> bool:
+        text = str(response_text or "").lower()
+        return int(status_code or 0) in {502, 503, 504} or ("cf_service_unavailable" in text)
+
+    @staticmethod
+    def _service_unavailable_backoff_seconds(*, attempt: int) -> int:
+        attempt_index = max(0, int(attempt) - 1)
+        backoff = (8, 20, 45)
+        return backoff[min(attempt_index, len(backoff) - 1)]
+
+    @staticmethod
+    def _is_invalid_auth_step(status_code: int, response_text: str) -> bool:
+        text = str(response_text or "").lower()
+        return int(status_code or 0) == 400 and (
+            "invalid_auth_step" in text or "invalid authorization step" in text
+        )
+
     def _defer_token_acquisition_rate_limit(self, result: RegistrationResult, login_error: str) -> bool:
         if self._is_existing_account or not self._create_account_account_id or self.batch_wait_slice_seconds is None:
             return False
 
-        retry_seconds = max(45, int(self.batch_wait_slice_seconds or 0))
+        retry_seconds = max(90, int(self.batch_wait_slice_seconds or 0))
         result.account_id = result.account_id or str(self._create_account_account_id or "").strip()
         result.workspace_id = result.workspace_id or str(
             self._last_validate_otp_workspace_id or self._create_account_workspace_id or ""
@@ -692,6 +711,53 @@ class RegistrationEngine:
                         f"{log_label}命中限流 429（第 {attempt}/{max_attempts} 次），{wait_seconds}s 后自动重试...",
                         "warning",
                     )
+                    if not self._sleep_interruptible(wait_seconds):
+                        return SignupFormResult(success=False, error_message="任务已取消")
+                    continue
+
+                if (
+                    self._is_transient_service_unavailable(response.status_code, response.text)
+                    and attempt < max_attempts
+                ):
+                    wait_seconds = self._service_unavailable_backoff_seconds(attempt=attempt)
+                    self._log(
+                        f"{log_label}命中上游临时不可用 {response.status_code}"
+                        f"（第 {attempt}/{max_attempts} 次），"
+                        f"{wait_seconds}s 后自动重试...",
+                        "warning",
+                    )
+                    try:
+                        refreshed = self._check_sentinel(current_did)
+                        if refreshed:
+                            current_sen_token = refreshed
+                    except Exception:
+                        pass
+                    try:
+                        if self.oauth_start and getattr(self.oauth_start, "auth_url", None):
+                            self.session.get(str(self.oauth_start.auth_url), timeout=12)
+                    except Exception:
+                        pass
+                    if not self._sleep_interruptible(wait_seconds):
+                        return SignupFormResult(success=False, error_message="任务已取消")
+                    continue
+
+                if self._is_invalid_auth_step(response.status_code, response.text) and attempt < max_attempts:
+                    wait_seconds = min(10, 3 * attempt)
+                    self._log(
+                        f"{log_label}命中 invalid_auth_step（第 {attempt}/{max_attempts} 次），"
+                        f"授权步骤可能错位，重建 OAuth 上下文后 {wait_seconds}s 再试...",
+                        "warning",
+                    )
+                    self._reset_auth_flow()
+                    if not self._init_session():
+                        return SignupFormResult(success=False, error_message="重建会话失败")
+                    if not self._start_oauth():
+                        return SignupFormResult(success=False, error_message="重建 OAuth 入口失败")
+                    current_did = str(self._get_device_id() or "").strip()
+                    if not current_did:
+                        return SignupFormResult(success=False, error_message="重建 Device ID 失败")
+                    self.device_id = current_did
+                    current_sen_token = self._check_sentinel(current_did)
                     if not self._sleep_interruptible(wait_seconds):
                         return SignupFormResult(success=False, error_message="任务已取消")
                     continue
@@ -1605,6 +1671,15 @@ class RegistrationEngine:
                 fetch_timeout=120,
                 attempted_codes=login_otp_tried_codes,
             )
+            if (not login_otp_ok) and (
+                str(self._last_otp_validation_error_code or "").strip().lower()
+                == "login_continue_url_registration_gate"
+            ):
+                login_otp_ok = self._recover_login_otp_with_full_restart(
+                    result,
+                    login_otp_tried_codes,
+                    stage_label="登录验证码",
+                )
             if not login_otp_ok:
                 result.error_message = "验证码校验失败"
                 return False
@@ -1794,6 +1869,15 @@ class RegistrationEngine:
                 fetch_timeout=120,
                 attempted_codes=login_otp_tried_codes,
             )
+            if (not login_otp_ok) and (
+                str(self._last_otp_validation_error_code or "").strip().lower()
+                == "login_continue_url_registration_gate"
+            ):
+                login_otp_ok = self._recover_login_otp_with_full_restart(
+                    result,
+                    login_otp_tried_codes,
+                    stage_label="登录验证码",
+                )
         if not login_otp_ok:
             result.error_message = "验证码校验失败"
             return False
@@ -2193,6 +2277,32 @@ class RegistrationEngine:
         except Exception as e:
             self._log(f"重触发登录 OTP 异常: {e}", "warning")
             return False
+
+    def _recover_login_otp_with_full_restart(
+        self,
+        result: RegistrationResult,
+        attempted_codes: set[str],
+        stage_label: str = "登录验证码",
+    ) -> bool:
+        """
+        当登录 OTP 命中“注册门页 continue_url / 脏会话”特征时，
+        直接重建整条登录链路，开启一轮新的 OTP 窗口再校验。
+        """
+        self._log(f"{stage_label}检测到脏会话特征，尝试完整重登链路后再校验一次...", "warning")
+        login_ready, login_error = self._restart_login_flow()
+        if not login_ready:
+            if self._is_rate_limit_error(login_error) and self._defer_token_acquisition_rate_limit(result, login_error):
+                return False
+            result.error_message = f"{stage_label}脏会话恢复失败: {login_error}"
+            return False
+
+        attempted_codes.clear()
+        return self._verify_email_otp_with_retry(
+            stage_label=f"{stage_label}(完整重登)",
+            max_attempts=3,
+            fetch_timeout=120,
+            attempted_codes=attempted_codes,
+        )
 
     def _register_password(self, did: Optional[str] = None, sen_token: Optional[str] = None) -> Tuple[bool, Optional[str]]:
         """注册密码"""

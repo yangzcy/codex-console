@@ -1,6 +1,6 @@
 """
 动态代理获取模块
-支持通过外部 API 获取动态代理 URL
+支持通过外部 API 获取代理 URL，并上报任务结果。
 """
 
 import logging
@@ -116,3 +116,57 @@ def get_proxy_url_for_task() -> Optional[str]:
 
     # 使用静态代理
     return settings.proxy_url
+
+
+def report_dynamic_proxy_result(
+    *,
+    report_url: str,
+    proxy_url: str,
+    task_id: str = "",
+    success: bool,
+    reason: str = "",
+    detail: str = "",
+    purpose: str = "openai_register",
+    proxy_id: str = "",
+    api_key: str = "",
+    api_key_header: str = "X-API-Key",
+) -> bool:
+    """向动态代理调度层上报任务结果。"""
+    try:
+        from curl_cffi import requests as cffi_requests
+
+        target_url = str(report_url or "").strip()
+        runtime_proxy = str(proxy_url or "").strip()
+        if not target_url or not runtime_proxy:
+            return False
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers[api_key_header] = api_key
+
+        payload = {
+            "proxy_id": str(proxy_id or "").strip(),
+            "proxy": runtime_proxy,
+            "task_id": str(task_id or "").strip(),
+            "purpose": str(purpose or "openai_register").strip(),
+            "success": bool(success),
+            "reason": str(reason or "").strip(),
+            "detail": str(detail or "").strip(),
+        }
+
+        response = cffi_requests.post(
+            target_url,
+            headers=headers,
+            json=payload,
+            timeout=10,
+            impersonate="chrome110",
+        )
+        if response.status_code != 200:
+            logger.warning("动态代理结果上报失败: status=%s body=%s", response.status_code, response.text[:200])
+            return False
+
+        logger.info("动态代理结果上报成功: task=%s success=%s reason=%s", payload["task_id"], payload["success"], payload["reason"])
+        return True
+    except Exception as e:
+        logger.warning("动态代理结果上报异常: %s", e)
+        return False

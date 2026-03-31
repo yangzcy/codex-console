@@ -276,6 +276,12 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
         category=SettingCategory.PROXY,
         description="从 JSON 响应中提取代理 URL 的字段路径（留空则使用响应原文）"
     ),
+    "proxy_dynamic_report_url": SettingDefinition(
+        db_key="proxy.dynamic_report_url",
+        default_value="",
+        category=SettingCategory.PROXY,
+        description="动态代理结果上报 API 地址（可选）"
+    ),
 
     # 注册配置
     "registration_max_retries": SettingDefinition(
@@ -724,6 +730,7 @@ class Settings(BaseModel):
     proxy_dynamic_api_key: Optional[SecretStr] = None
     proxy_dynamic_api_key_header: str = "X-API-Key"
     proxy_dynamic_result_field: str = ""
+    proxy_dynamic_report_url: str = ""
 
     @property
     def proxy_url(self) -> Optional[str]:

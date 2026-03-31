@@ -260,6 +260,7 @@ async def get_dynamic_proxy_settings():
     return {
         "enabled": settings.proxy_dynamic_enabled,
         "api_url": settings.proxy_dynamic_api_url,
+        "report_url": settings.proxy_dynamic_report_url,
         "api_key_header": settings.proxy_dynamic_api_key_header,
         "result_field": settings.proxy_dynamic_result_field,
         "has_api_key": bool(settings.proxy_dynamic_api_key and settings.proxy_dynamic_api_key.get_secret_value()),
@@ -270,6 +271,7 @@ class DynamicProxySettings(BaseModel):
     """动态代理设置"""
     enabled: bool = False
     api_url: str = ""
+    report_url: str = ""
     api_key: Optional[str] = None
     api_key_header: str = "X-API-Key"
     result_field: str = ""
@@ -281,6 +283,7 @@ async def update_dynamic_proxy_settings(request: DynamicProxySettings):
     update_dict = {
         "proxy_dynamic_enabled": request.enabled,
         "proxy_dynamic_api_url": request.api_url,
+        "proxy_dynamic_report_url": request.report_url,
         "proxy_dynamic_api_key_header": request.api_key_header,
         "proxy_dynamic_result_field": request.result_field,
     }
