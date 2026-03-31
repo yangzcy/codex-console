@@ -22,6 +22,8 @@ from ...database import crud
 from ...database.session import get_db
 from ...database.models import RegistrationTask, Proxy
 from ...core.register import RegistrationEngine, RegistrationResult
+from ...core.registration_retry_policy import build_retry_action
+from ..registration_task_scheduler import should_run_deferred_task
 from ...services import EmailServiceFactory, EmailServiceType
 from ...config.settings import get_settings
 from ..task_manager import task_manager
@@ -488,6 +490,106 @@ def _make_task_execution_outcome(outcome: str, error: str = "", email: str = "")
     }
 
 
+def _gate_task_execution_by_retry_window(task_uuid: str):
+    with get_db() as db:
+        task = crud.get_registration_task_by_uuid(db, task_uuid)
+        if not task:
+            return True, None
+        if not should_run_deferred_task(task, now=datetime.utcnow()):
+            next_retry_at = getattr(task, "next_retry_at", None)
+            reason = str(getattr(task, "error_message", "") or "任务尚未到达下一次重试时间").strip()
+            task_manager.update_status(
+                task_uuid,
+                "deferred",
+                deferred=True,
+                reason=reason,
+                next_retry_at=next_retry_at.isoformat() if next_retry_at else None,
+            )
+            return False, _make_task_execution_outcome("deferred", error=reason)
+        return True, None
+
+
+def _apply_retry_policy_for_failed_task(
+    db,
+    task_uuid: str,
+    result: RegistrationResult,
+    email_service_type: str,
+):
+    task = crud.get_registration_task_by_uuid(db, task_uuid)
+    if not task:
+        return _make_task_execution_outcome("failed", error=result.error_message)
+
+    retry_count = int(getattr(task, "retry_count", 0) or 0)
+    reason_code = str(getattr(result, "reason_code", "") or "unknown_retryable")
+    phase = str(getattr(result, "phase", "") or getattr(task, "phase", "") or "")
+
+    action = build_retry_action(
+        email_service_type=email_service_type,
+        reason_code=reason_code,
+        current_phase=phase,
+        retry_count=retry_count,
+        now=datetime.utcnow(),
+    )
+
+    if action.mark_dead:
+        crud.update_registration_task_retry_state(
+            db,
+            task_uuid,
+            status="failed",
+            reason_code=reason_code,
+            retry_count=retry_count + 1,
+            phase=phase,
+        )
+        task_manager.update_status(task_uuid, "failed", error=result.error_message)
+        logger.warning(f"注册任务失败: {task_uuid}, 原因: {result.error_message}")
+        return _make_task_execution_outcome("failed", error=result.error_message)
+
+    if action.should_defer:
+        crud.update_registration_task_retry_state(
+            db,
+            task_uuid,
+            status="deferred",
+            reason_code=reason_code,
+            defer_bucket=action.defer_bucket,
+            retry_count=retry_count + 1,
+            next_retry_at=action.next_retry_at,
+            phase=action.resume_phase,
+            context_version=(
+                int(getattr(task, "context_version", 0) or 0)
+                + (1 if (action.should_rotate_email_context or action.should_rotate_identity_context or action.should_rotate_proxy_context) else 0)
+            ),
+        )
+        task_manager.update_status(
+            task_uuid,
+            "deferred",
+            error=result.error_message,
+            deferred=True,
+            reason=result.error_message,
+            reason_code=reason_code,
+            next_retry_at=action.next_retry_at.isoformat() if action.next_retry_at else None,
+        )
+        logger.info(
+            "注册任务延后重试: %s, reason_code=%s, phase=%s, next_retry_at=%s",
+            task_uuid,
+            reason_code,
+            action.resume_phase,
+            action.next_retry_at.isoformat() if action.next_retry_at else "",
+        )
+        return _make_task_execution_outcome("deferred", error=result.error_message)
+
+    crud.update_registration_task_retry_state(
+        db,
+        task_uuid,
+        status="failed",
+        reason_code=reason_code,
+        retry_count=retry_count + 1,
+        phase=phase,
+    )
+    task_manager.update_status(task_uuid, "failed", error=result.error_message)
+    logger.warning(f"注册任务失败: {task_uuid}, 原因: {result.error_message}")
+    return _make_task_execution_outcome("failed", error=result.error_message)
+
+
 def _classify_proxy_report_reason(error_text: str, outcome: str) -> str:
     text = str(error_text or "").strip().lower()
     outcome_key = str(outcome or "").strip().lower()
@@ -902,25 +1004,20 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     logger.info(f"注册任务取消收尾: {task_uuid}")
                     return _make_task_execution_outcome("cancelled", error=reason)
 
-                crud.update_registration_task(
-                    db, task_uuid,
-                    status="failed",
-                    completed_at=datetime.utcnow(),
-                    error_message=result.error_message
+                outcome = _apply_retry_policy_for_failed_task(
+                    db,
+                    task_uuid,
+                    result,
+                    email_service_type,
                 )
-
-                # 更新 TaskManager 状态
-                task_manager.update_status(task_uuid, "failed", error=result.error_message)
                 _report_dynamic_proxy_result_if_needed(
                     dynamic_proxy_used=dynamic_proxy_used,
                     proxy_url=openai_proxy_url,
                     task_uuid=task_uuid,
-                    outcome="failed",
+                    outcome=outcome.get("outcome", "failed"),
                     error_message=result.error_message,
                 )
-
-                logger.warning(f"注册任务失败: {task_uuid}, 原因: {result.error_message}")
-                return _make_task_execution_outcome("failed", error=result.error_message)
+                return outcome
 
         except Exception as e:
             logger.error(f"注册任务异常: {task_uuid}, 错误: {e}")
@@ -968,6 +1065,10 @@ async def run_registration_task(task_uuid: str, email_service_type: str, proxy: 
     if loop is None:
         loop = asyncio.get_event_loop()
         task_manager.set_loop(loop)
+
+    can_run, gated_outcome = _gate_task_execution_by_retry_window(task_uuid)
+    if not can_run:
+        return gated_outcome
 
     # 初始化 TaskManager 状态
     task_manager.update_status(task_uuid, "pending")

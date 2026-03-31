@@ -639,3 +639,18 @@ def test_run_retries_with_fresh_email_when_create_account_reports_existing_user(
     assert created_emails == ["retry-1@example.com", "retry-2@example.com"]
     assert result.email == "retry-2@example.com"
     assert complete_calls == ["retry-2@example.com"]
+
+
+def test_registration_result_to_dict_includes_phase_and_reason_code():
+    result = RegistrationResult(
+        success=False,
+        email="tester@example.com",
+        error_message="等待验证码超时（15 秒）",
+        phase="signup_otp_waiting",
+        reason_code="email_otp_timeout",
+    )
+
+    payload = result.to_dict()
+
+    assert payload["phase"] == "signup_otp_waiting"
+    assert payload["reason_code"] == "email_otp_timeout"

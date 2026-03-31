@@ -433,6 +433,44 @@ def update_registration_task(
     return db_task
 
 
+def update_registration_task_phase(
+    db: Session,
+    task_uuid: str,
+    phase: str,
+) -> Optional[RegistrationTask]:
+    """更新注册任务阶段"""
+    return update_registration_task(db, task_uuid, phase=phase)
+
+
+def update_registration_task_retry_state(
+    db: Session,
+    task_uuid: str,
+    *,
+    status: str,
+    reason_code: Optional[str] = None,
+    defer_bucket: Optional[str] = None,
+    retry_count: Optional[int] = None,
+    next_retry_at=None,
+    phase: Optional[str] = None,
+    context_version: Optional[int] = None,
+) -> Optional[RegistrationTask]:
+    """更新注册任务重试状态"""
+    payload = {"status": status}
+    if reason_code is not None:
+        payload["reason_code"] = reason_code
+    if defer_bucket is not None:
+        payload["defer_bucket"] = defer_bucket
+    if retry_count is not None:
+        payload["retry_count"] = retry_count
+    if next_retry_at is not None:
+        payload["next_retry_at"] = next_retry_at
+    if phase is not None:
+        payload["phase"] = phase
+    if context_version is not None:
+        payload["context_version"] = context_version
+    return update_registration_task(db, task_uuid, **payload)
+
+
 def append_task_log(db: Session, task_uuid: str, log_message: str) -> bool:
     """追加任务日志"""
     db_task = get_registration_task_by_uuid(db, task_uuid)

@@ -132,6 +132,12 @@ class RegistrationTask(Base):
     logs = Column(Text)  # 注册过程日志
     result = Column(JSONEncodedDict)  # 注册结果
     error_message = Column(Text)
+    phase = Column(String(50))
+    reason_code = Column(String(50))
+    defer_bucket = Column(String(30))
+    retry_count = Column(Integer, default=0)
+    next_retry_at = Column(DateTime)
+    context_version = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime)
     completed_at = Column(DateTime)

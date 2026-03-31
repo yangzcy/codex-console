@@ -19,6 +19,7 @@ from curl_cffi import requests as cffi_requests
 
 from .openai.oauth import OAuthManager, OAuthStart
 from .http_client import OpenAIHTTPClient, HTTPClientError
+from .registration_failures import classify_registration_failure
 from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType
 from ..database import crud
 from ..database.session import get_db
@@ -54,6 +55,8 @@ class RegistrationResult:
     session_token: str = ""  # 会话令牌
     device_id: str = ""  # oai-did
     error_message: str = ""
+    phase: str = ""
+    reason_code: str = ""
     logs: list = None
     metadata: dict = None
     source: str = "register"  # 'register' 或 'login'，区分账号来源
@@ -72,6 +75,8 @@ class RegistrationResult:
             "session_token": self.session_token[:20] + "..." if self.session_token else "",
             "device_id": self.device_id,
             "error_message": self.error_message,
+            "phase": self.phase,
+            "reason_code": self.reason_code,
             "logs": self.logs or [],
             "metadata": self.metadata or {},
             "source": self.source,
@@ -224,6 +229,23 @@ class RegistrationEngine:
             self.session = None
             self.oauth_start = None
             self.session_token = None
+
+    @staticmethod
+    def _set_result_phase(result: RegistrationResult, phase: str) -> None:
+        if result is not None:
+            result.phase = str(phase or "").strip()
+
+    @staticmethod
+    def _finalize_result_failure_reason(result: RegistrationResult) -> None:
+        if result is None:
+            return
+        if result.success or result.reason_code or not result.error_message:
+            return
+        decision = classify_registration_failure(
+            error_message=result.error_message,
+            phase=result.phase or None,
+        )
+        result.reason_code = decision.reason_code.value
 
     def _should_retry_with_fresh_email(self) -> bool:
         register_error = str(self._last_register_password_error or "").lower()
@@ -3526,6 +3548,7 @@ class RegistrationEngine:
             for identity_attempt in range(1, max_fresh_email_attempts + 1):
                 outcome_reported = False
                 self._reset_registration_attempt_state(close_auth_flow=(identity_attempt > 1))
+                self._set_result_phase(result, "init")
                 if identity_attempt > 1:
                     self._log(
                         f"检测到邮箱已被 OpenAI 占用，切换新邮箱重试注册（第 {identity_attempt}/{max_fresh_email_attempts} 次）...",
@@ -3603,12 +3626,14 @@ class RegistrationEngine:
 
                     self._log("7. 等验证码飞来，邮箱请注意查收...")
                     self._log("8. 对一下验证码，看看是不是本人...")
+                    self._set_result_phase(result, "signup_otp_waiting")
                     if not self._verify_email_otp_with_retry(stage_label="注册验证码", max_attempts=3):
                         if self._apply_batch_wait_deferred_result(result):
                             return result
                         result.error_message = "验证验证码失败"
                         return result
 
+                    self._set_result_phase(result, "signup_otp_verified")
                     self._log("9. 给账号办个正式户口，名字写档案里...")
                     if not self._create_user_account():
                         should_retry_with_fresh_email = self._should_retry_with_fresh_email()
@@ -3616,6 +3641,7 @@ class RegistrationEngine:
                             result.error_message = "创建用户账户失败"
                             return result
 
+                    self._set_result_phase(result, "profile_submitted")
                     if should_retry_with_fresh_email:
                         self._report_current_email_outcome(
                             success=False,
@@ -3639,17 +3665,20 @@ class RegistrationEngine:
                 break
 
             if effective_entry_flow == "native":
+                self._set_result_phase(result, "oauth_finish")
                 if not self._complete_token_exchange_native_backup(result):
                     if self._apply_batch_wait_deferred_result(result):
                         return result
                     return result
             elif effective_entry_flow == "outlook":
+                self._set_result_phase(result, "oauth_finish")
                 if not self._complete_token_exchange_outlook(result):
                     if self._apply_batch_wait_deferred_result(result):
                         return result
                     return result
             else:
                 use_abcard_entry = (effective_entry_flow == "abcard") and (not self._is_existing_account)
+                self._set_result_phase(result, "oauth_finish")
                 if not self._complete_token_exchange(result, require_login_otp=not use_abcard_entry):
                     if self._apply_batch_wait_deferred_result(result):
                         return result
@@ -3668,6 +3697,7 @@ class RegistrationEngine:
             self._log("=" * 60)
 
             result.success = True
+            self._set_result_phase(result, "done")
             settings = get_settings()
             client_id = str(getattr(settings, "openai_client_id", "") or getattr(self.oauth_manager, "client_id", "") or "").strip()
             result.metadata = {
@@ -3698,6 +3728,7 @@ class RegistrationEngine:
             outcome_reported = True
             return result
         finally:
+            self._finalize_result_failure_reason(result)
             self._merge_email_service_runtime_metadata(result)
             if not outcome_reported and self.email and (result.success or result.error_message):
                 self._report_current_email_outcome(
