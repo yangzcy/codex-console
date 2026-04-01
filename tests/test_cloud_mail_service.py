@@ -50,6 +50,23 @@ def test_report_registration_outcome_success_clears_runtime_cooldown(monkeypatch
     assert snapshot["domain_states"]["a.example.com"]["cooldown_until"] == 0
 
 
+def test_report_registration_outcome_failure_sets_runtime_cooldown(monkeypatch, tmp_path):
+    health_path = tmp_path / "cloud_mail_domain_health.json"
+    monkeypatch.setattr(CloudMailService, "_health_store_path", staticmethod(lambda: health_path))
+    _reset_cloud_mail_state()
+
+    service = _make_service()
+    service.report_registration_outcome(
+        "tester@a.example.com",
+        success=False,
+        error_message="registration_disallowed",
+    )
+
+    runtime_key = "https://mail.example.com::a.example.com"
+    assert runtime_key in CloudMailService._runtime_domain_block_until
+    assert CloudMailService._runtime_domain_block_until[runtime_key] > 0
+
+
 def test_get_candidate_domains_limits_exploratory_slots(monkeypatch, tmp_path):
     health_path = tmp_path / "cloud_mail_domain_health.json"
     monkeypatch.setattr(CloudMailService, "_health_store_path", staticmethod(lambda: health_path))

@@ -554,6 +554,7 @@ class CloudMailService(BaseEmailService):
 
             if cooldown_seconds > 0:
                 state["cooldown_until"] = max(float(state.get("cooldown_until") or 0.0), now_ts + cooldown_seconds)
+                CloudMailService._runtime_domain_block_until[f"{base_url}::{domain}"] = state["cooldown_until"]
                 logger.warning(
                     "Cloud Mail 域名进入冷却: %s, outcome=%s, cooldown=%ss",
                     domain,
