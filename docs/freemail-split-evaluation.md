@@ -1,26 +1,26 @@
-# Freemail Split Evaluation
+# Freemail 任务切分评估
 
-## Version Scope
+## 版本范围
 
-This note evaluates the current `freemail` registration flow after the retry-state split work landed, while keeping the existing queue-yield and deferred-execution direction unchanged.
+本文用于评估当前 `freemail` 注册流程在“重试状态拆分”落地之后的表现，同时默认继续沿用现有的队列让位与延后执行方向，不改变这条主线设计。
 
-## Evaluation
+## 总体评价
 
-The current `freemail` version is meaningfully stronger than the earlier monolithic task flow. It has moved from "can run" to "can run with control". The improvement is not based on extending wait times. It comes from turning common `freemail` registration failures into structured, observable, short-deferral decisions that still preserve overall batch throughput.
+当前版本的 `freemail` 相比早期的单体式任务流，稳定性和可控性都有明显提升。它已经从“能跑”提升到了“能带着控制地跑”。这次改进的核心并不在于单纯拉长等待时间，而是在于把 `freemail` 注册过程中常见的失败场景，转换成结构化、可观测、可短暂延后的决策，同时尽量不牺牲整批任务的吞吐节奏。
 
-## Strengths
+## 现有优势
 
-- `freemail` failures such as OTP wait timeout now enter a short deferred retry path instead of being treated as immediate hard failures.
-- Task visibility is better because the registration task now exposes `phase`, `reason_code`, `retry_count`, `defer_bucket`, and `next_retry_at`.
-- The legacy batch yield branch has been unified into the same retry-state model, but it still keeps the short batch retry window, so the overall queue pace is not slowed down.
-- The implementation scope remains narrow and local to the registration feature. It does not introduce broad cross-project refactors.
+- `freemail` 在验证码等待超时等场景下，不再直接被当作一次性硬失败，而是进入短周期的延后重试路径。
+- 注册任务的可见性更强，当前任务状态已经能够暴露 `phase`、`reason_code`、`retry_count`、`defer_bucket`、`next_retry_at` 等关键信息。
+- 历史上的批量让位分支已经并入统一的重试状态模型，但仍保留了短周期批量重试窗口，因此没有明显拖慢整体队列推进速度。
+- 实现范围仍然比较克制，主要集中在注册功能内部，没有扩散成跨项目的大范围重构。
 
-## Current Boundary
+## 当前边界
 
-- This is not yet a true phase-resume implementation. It is a closed-loop retry-state upgrade, not a full resume-from-phase executor.
-- Some branches are still compatibility-oriented rather than fully isolated `freemail`-specific execution paths.
-- Future work should continue splitting email-context rotation, domain switching, and phase resume in small steps instead of adding more branching to the current route layer.
+- 这还不算真正意义上的阶段恢复实现。当前更准确地说是一次闭环式的重试状态升级，而不是完整的“从某个阶段继续恢复执行”的执行器。
+- 部分分支目前仍偏兼容性处理，还没有完全演进成彻底隔离的 `freemail` 专属执行路径。
+- 后续如果继续演进，建议把邮箱上下文轮换、域名切换、阶段恢复分别按小步拆开推进，而不是继续在当前路由层里叠加更多条件分支。
 
-## Conclusion
+## 结论
 
-This `freemail` version is suitable as a stable verification baseline. The direction is correct, the gains are real, and the risk has been kept under control.
+当前这版 `freemail` 已经可以作为一个稳定的验证基线。方向是对的，收益是真实的，而且风险目前控制得比较稳。
