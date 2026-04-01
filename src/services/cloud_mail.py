@@ -14,11 +14,61 @@ import requests
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .base import BaseEmailService, EmailServiceError, EmailServiceType
 from ..config.constants import OTP_CODE_PATTERN
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_domain(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    if "://" in text:
+        parsed = urlparse(text)
+        candidate = parsed.hostname or parsed.netloc or parsed.path
+        text = candidate or text
+
+    return text.strip().lstrip("@").rstrip("/").lower()
+
+
+def _to_timestamp(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        try:
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            return datetime.fromisoformat(text).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _looks_like_naive_datetime_string(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    if "T" not in text and " " not in text:
+        return False
+    if text.endswith("Z"):
+        return False
+    time_part = text.split("T", 1)[-1] if "T" in text else text.rsplit(" ", 1)[-1]
+    return "+" not in time_part and "-" not in time_part
 
 
 class CloudMailService(BaseEmailService):
@@ -66,6 +116,7 @@ class CloudMailService(BaseEmailService):
         }
         self.config = {**default_config, **(config or {})}
         self.config["base_url"] = self.config["base_url"].rstrip("/")
+        self.config["domain"] = self._normalize_domain_list(self.config.get("domain"))
         try:
             self.config["exploratory_probe_slots"] = max(0, int(self.config.get("exploratory_probe_slots", 2)))
         except (TypeError, ValueError):
@@ -91,7 +142,8 @@ class CloudMailService(BaseEmailService):
 
         # 缓存邮箱信息（实例级别）
         self._created_emails: Dict[str, Dict[str, Any]] = {}
-        self._seen_email_ids: Dict[str, set] = {}  # 跨调用记录已处理的邮件ID
+        self._stage_seen_mail_ids: Dict[str, set] = {}
+        self._last_used_mail_ids: Dict[str, str] = {}
 
     @staticmethod
     def _health_store_path() -> Path:
@@ -103,11 +155,22 @@ class CloudMailService(BaseEmailService):
     @staticmethod
     def _normalize_domain_list(value: Any) -> List[str]:
         if isinstance(value, list):
-            domains = [str(item or "").strip().lower().lstrip("@") for item in value]
-        elif value in (None, ""):
-            domains = []
+            domains = [_normalize_domain(item) for item in value]
         else:
-            domains = [item.strip().lower().lstrip("@") for item in str(value).split(",")]
+            text = str(value or "").strip()
+            if text.startswith("[") and text.endswith("]"):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        domains = [_normalize_domain(item) for item in parsed]
+                    else:
+                        domains = [_normalize_domain(text)]
+                except Exception:
+                    domains = [_normalize_domain(item) for item in text.split(",")]
+            elif "," in text:
+                domains = [_normalize_domain(item) for item in text.split(",")]
+            else:
+                domains = [_normalize_domain(text)]
 
         result: List[str] = []
         for domain in domains:
@@ -428,6 +491,7 @@ class CloudMailService(BaseEmailService):
             state["updated_at"] = now_iso
             state["last_error"] = str(error_message or "").strip()
             state["last_outcome"] = outcome
+            self._decrement_domain_inflight(base_url, domain)
 
             if success:
                 state["success_count"] = int(state.get("success_count") or 0) + 1
@@ -798,6 +862,11 @@ class CloudMailService(BaseEmailService):
                                 len(candidate_domains),
                             )
                             continue
+                    self.report_registration_outcome(
+                        f"probe@{selected_domain}",
+                        success=False,
+                        error_message=f"创建邮箱失败: {error_text}",
+                    )
                     self.update_status(False, e)
                     if idx < len(candidate_domains):
                         logger.warning(
@@ -840,11 +909,12 @@ class CloudMailService(BaseEmailService):
         logger.info(f"正在从 Cloud Mail 邮箱 {email} 获取验证码...")
 
         start_time = time.time()
-        # 使用实例变量跨调用记录已处理的邮件ID
-        if email not in self._seen_email_ids:
-            self._seen_email_ids[email] = set()
-        seen_ids = self._seen_email_ids[email]
+        stage_marker = f"{email}|{int(float(otp_sent_at or 0))}"
+        seen_ids = self._stage_seen_mail_ids.setdefault(stage_marker, set())
+        last_used_mail_id = str(self._last_used_mail_ids.get(email) or "").strip()
+        last_error: Optional[Exception] = None
         check_count = 0
+        unknown_ts_grace_seconds = max(6, int(min(timeout, max(poll_interval * 3, 6))))
 
         while time.time() - start_time < timeout:
             try:
@@ -868,51 +938,115 @@ class CloudMailService(BaseEmailService):
                     time.sleep(poll_interval)
                     continue
 
+                def _mail_sort_key(mail: Dict[str, Any]) -> tuple:
+                    raw_created_at = (
+                        mail.get("createdAt")
+                        or mail.get("created_at")
+                        or mail.get("receivedAt")
+                        or mail.get("received_at")
+                        or mail.get("date")
+                        or mail.get("timestamp")
+                    )
+                    created_at = _to_timestamp(raw_created_at) or 0.0
+                    mail_id = mail.get("emailId") or mail.get("id") or mail.get("messageId") or 0
+                    try:
+                        mail_id_num = int(mail_id)
+                    except Exception:
+                        mail_id_num = 0
+                    return (created_at, mail_id_num)
+
+                emails = sorted(emails, key=_mail_sort_key, reverse=True)
+                candidates: List[Dict[str, Any]] = []
+                unknown_ts_candidates: List[Dict[str, Any]] = []
+
                 for email_item in emails:
-                    email_id = email_item.get("emailId")
-                    
-                    if not email_id:
-                        continue
-                    
+                    email_id = (
+                        email_item.get("emailId")
+                        or email_item.get("id")
+                        or email_item.get("messageId")
+                        or f"{email_item.get('sendEmail','')}|{email_item.get('subject','')}|"
+                        f"{email_item.get('createdAt') or email_item.get('receivedAt') or email_item.get('timestamp')}"
+                    )
+
                     if email_id in seen_ids:
                         continue
-                    
+                    if last_used_mail_id and str(email_id) == last_used_mail_id:
+                        continue
+
+                    raw_created_at = (
+                        email_item.get("createdAt")
+                        or email_item.get("created_at")
+                        or email_item.get("receivedAt")
+                        or email_item.get("received_at")
+                        or email_item.get("date")
+                        or email_item.get("timestamp")
+                    )
+                    created_at = _to_timestamp(raw_created_at)
+                    if otp_sent_at and created_at and created_at + 2 < otp_sent_at:
+                        skew_seconds = otp_sent_at - created_at
+                        if not (_looks_like_naive_datetime_string(raw_created_at) and skew_seconds >= 6 * 3600):
+                            seen_ids.add(email_id)
+                            continue
+
                     sender_email = str(email_item.get("sendEmail", "")).lower()
                     sender_name = str(email_item.get("sendName", "")).lower()
                     subject = str(email_item.get("subject", ""))
-                    
-                    if "openai" not in sender_email and "openai" not in sender_name:
+                    content = str(email_item.get("content", ""))
+                    clean_content = re.sub(r"<[^>]+>", " ", content)
+                    email_pattern = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
+                    clean_content = re.sub(email_pattern, "", clean_content)
+                    search_text = "\n".join([sender_email, sender_name, subject, clean_content])
+
+                    if "openai" not in search_text.lower():
                         seen_ids.add(email_id)
                         continue
 
-                    # 从主题提取
-                    match = re.search(pattern, subject)
-                    if match:
-                        code = match.group(1)
-                        logger.info(f"从邮件 {email_id} 提取到验证码")
+                    match = re.search(pattern, subject) or re.search(pattern, clean_content)
+                    if not match:
                         seen_ids.add(email_id)
-                        self.update_status(True)
-                        return code
+                        continue
 
-                    # 从内容提取
-                    content = str(email_item.get("content", ""))
-                    if content:
-                        clean_content = re.sub(r"<[^>]+>", " ", content)
-                        email_pattern = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
-                        clean_content = re.sub(email_pattern, "", clean_content)
-                        
-                        match = re.search(pattern, clean_content)
-                        if match:
-                            code = match.group(1)
-                            print(f"[CloudMail] ✅ 找到验证码: {code}", flush=True)
-                            sys.stdout.flush()
-                            seen_ids.add(email_id)
-                            self.update_status(True)
-                            return code
-                    
-                    seen_ids.add(email_id)
+                    candidate = {
+                        "mail_id": str(email_id),
+                        "code": match.group(1),
+                        "created_at": created_at,
+                        "has_ts": created_at is not None,
+                        "is_recent": bool(
+                            otp_sent_at and (created_at is not None) and (created_at + 2 >= otp_sent_at)
+                        ),
+                    }
+                    if otp_sent_at and created_at is None:
+                        unknown_ts_candidates.append(candidate)
+                    else:
+                        candidates.append(candidate)
+
+                elapsed = time.time() - start_time
+                if otp_sent_at and (not candidates) and unknown_ts_candidates and elapsed < unknown_ts_grace_seconds:
+                    time.sleep(poll_interval)
+                    continue
+
+                all_candidates = candidates + unknown_ts_candidates
+                if all_candidates:
+                    best = sorted(
+                        all_candidates,
+                        key=lambda item: (
+                            1 if item.get("is_recent") else 0,
+                            1 if item.get("has_ts") else 0,
+                            float(item.get("created_at") or 0.0),
+                        ),
+                        reverse=True,
+                    )[0]
+                    best_mail_id = str(best["mail_id"])
+                    seen_ids.add(best_mail_id)
+                    self._last_used_mail_ids[email] = best_mail_id
+                    code = str(best["code"])
+                    print(f"[CloudMail] ✅ 找到验证码: {code}", flush=True)
+                    sys.stdout.flush()
+                    self.update_status(True)
+                    return code
 
             except Exception as e:
+                last_error = e
                 print(f"[CloudMail] 异常: {e}", flush=True)
                 sys.stdout.flush()
                 # 如果是认证错误，强制刷新token
@@ -928,6 +1062,8 @@ class CloudMailService(BaseEmailService):
 
             time.sleep(poll_interval)
 
+        if last_error:
+            logger.warning(f"等待 Cloud Mail 验证码超时: {email}，最后一次错误: {last_error}")
         print(f"[CloudMail] 超时！检查{check_count}次，已处理: {list(seen_ids)}", flush=True)
         sys.stdout.flush()
         return None
