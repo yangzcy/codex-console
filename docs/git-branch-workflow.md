@@ -7,7 +7,7 @@
 - `main`：稳定、可部署、可发布的正式分支
 - `dev`：日常开发分支
 
-平时所有开发都先提交到 `dev`，验证没问题后再合并到 `main`。
+平时所有开发都先提交到 `dev`，远程 `main` 不接受直接推送，只通过远程 `dev -> main` 的 Pull Request 合并。
 
 ## 当前里程碑
 
@@ -37,21 +37,38 @@ git push userrepo dev
 
 ## 发布流程
 
-当 `dev` 已经验证完成、可以发布时，再合并到 `main`：
+当 `dev` 已经验证完成、可以发布时，不再从本地直接推送 `main`，而是发起远程 `dev -> main` 的 Pull Request：
+
+```bash
+cd /root/codex-console
+git checkout dev
+git pull userrepo dev
+git push userrepo dev
+```
+
+然后在 GitHub 仓库页面发起：
+
+```text
+base: main
+compare: dev
+```
+
+确认无误后在 GitHub 上完成合并。
+
+本地如果需要同步最新正式代码，再执行：
 
 ```bash
 cd /root/codex-console
 git checkout main
 git pull userrepo main
-git merge --no-ff dev
-git push userrepo main
 ```
 
 建议遵循以下原则：
 
 - `main` 始终保持可部署状态
 - 不要直接在 `main` 上开发
-- 合并时保留 `--no-ff`，这样每次从 `dev` 回到 `main` 的记录都清晰可见
+- `main` 只接收来自远程 `dev` 的合并
+- 发布合并统一通过 GitHub PR 完成，历史记录更清晰
 
 ## 里程碑打标
 
@@ -96,6 +113,23 @@ git fetch userrepo
 ```
 
 如果后续需要吸收上游更新，建议先在 `dev` 上处理和验证，不要直接在 `main` 上操作。
+
+## 本地分支跟踪建议
+
+建议本地分支按下面方式跟踪：
+
+- 本地 `dev` 跟踪 `userrepo/dev`
+- 本地 `main` 跟踪 `userrepo/main`
+
+设置命令如下：
+
+```bash
+git branch --set-upstream-to=userrepo/dev dev
+git branch --set-upstream-to=userrepo/main main
+git checkout dev
+```
+
+这样以后日常开发时，默认停留在 `dev` 即可。
 
 ## GitHub 认证
 
@@ -155,7 +189,8 @@ git remote set-url userrepo git@github.com:yangzcy/codex-console.git
 建议在 GitHub 上对 `main` 开启保护：
 
 - 禁止直接推送
-- 要求通过 PR 或受控合并流程进入 `main`
+- 要求通过 Pull Request 合并进入 `main`
 - 将 `dev` 作为持续开发分支
+- 对管理员同样生效，避免误操作绕过保护
 
 即使是小型私有项目，不走完整 PR 流程，保护 `main` 也依然有价值。
