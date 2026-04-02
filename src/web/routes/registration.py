@@ -23,6 +23,7 @@ from ...database.session import get_db
 from ...database.models import RegistrationTask, Proxy
 from ...core.register import RegistrationEngine, RegistrationResult
 from ...core.registration_failures import classify_registration_failure
+from ...core.mailbox_registry import MailboxRegistry
 from ...core.registration_retry_policy import build_retry_action
 from ..registration_task_scheduler import should_run_deferred_task
 from ...services import EmailServiceFactory, EmailServiceType
@@ -434,6 +435,11 @@ SERVICE_DISPLAY_NAMES = {
     "cloud_mail": "CloudMail",
 }
 
+HARD_INVALID_MAILBOX_REASON_CODES = {
+    "registration_disallowed",
+    "mailbox_invalid_domain",
+}
+
 
 def _resolve_task_email_service(task: RegistrationTask, db=None) -> Tuple[Optional[str], Optional[str]]:
     """从任务结果或邮箱服务配置中解析服务类型和显示名。"""
@@ -477,6 +483,46 @@ def _resolve_task_email(task: RegistrationTask) -> Optional[str]:
     if isinstance(result, dict) and result.get("email"):
         return result.get("email")
     return None
+
+
+def _record_mailbox_governance_state(
+    *,
+    task_uuid: str,
+    email_service_type: str,
+    result: RegistrationResult,
+    next_state: str,
+    next_retry_at: Optional[datetime] = None,
+) -> None:
+    email = str(getattr(result, "email", "") or "").strip().lower()
+    if not email:
+        return
+
+    service_id = email
+    reason_code = str(getattr(result, "reason_code", "") or "").strip() or None
+
+    try:
+        if next_state == "deferred_hold":
+            MailboxRegistry.mark_deferred(
+                email=email,
+                service_type=email_service_type,
+                service_id=service_id,
+                task_uuid=task_uuid,
+                reason_code=reason_code,
+                next_retry_at=next_retry_at.isoformat() if next_retry_at else None,
+            )
+            return
+
+        if next_state == "failed":
+            MailboxRegistry.mark_failed(
+                email=email,
+                service_type=email_service_type,
+                service_id=service_id,
+                task_uuid=task_uuid,
+                reason_code=reason_code,
+                hard_invalid=bool(reason_code in HARD_INVALID_MAILBOX_REASON_CODES),
+            )
+    except Exception as exc:
+        logger.warning("邮箱治理状态写入失败: task=%s email=%s error=%s", task_uuid, email, exc)
 
 
 def _normalize_email_service_config(
@@ -556,6 +602,12 @@ def _apply_retry_policy_for_failed_task(
     )
 
     if action.mark_dead:
+        _record_mailbox_governance_state(
+            task_uuid=task_uuid,
+            email_service_type=email_service_type,
+            result=result,
+            next_state="failed",
+        )
         crud.update_registration_task_retry_state(
             db,
             task_uuid,
@@ -569,6 +621,13 @@ def _apply_retry_policy_for_failed_task(
         return _make_task_execution_outcome("failed", error=result.error_message)
 
     if action.should_defer:
+        _record_mailbox_governance_state(
+            task_uuid=task_uuid,
+            email_service_type=email_service_type,
+            result=result,
+            next_state="deferred_hold",
+            next_retry_at=action.next_retry_at,
+        )
         crud.update_registration_task_retry_state(
             db,
             task_uuid,
@@ -601,6 +660,12 @@ def _apply_retry_policy_for_failed_task(
         )
         return _make_task_execution_outcome("deferred", error=result.error_message)
 
+    _record_mailbox_governance_state(
+        task_uuid=task_uuid,
+        email_service_type=email_service_type,
+        result=result,
+        next_state="failed",
+    )
     crud.update_registration_task_retry_state(
         db,
         task_uuid,
@@ -654,6 +719,21 @@ def _apply_batch_wait_deferred_task_state(
     next_retry_at = datetime.utcnow() + timedelta(seconds=BATCH_OTP_WAIT_RETRY_DELAY_SECONDS)
     defer_bucket = action.defer_bucket or "deferred_short"
     resume_phase = action.resume_phase or phase or getattr(task, "phase", None)
+
+    batch_wait_result = RegistrationResult(
+        success=False,
+        email=_resolve_task_email(task) or "",
+        error_message=reason,
+        phase=phase,
+        reason_code=reason_code,
+    )
+    _record_mailbox_governance_state(
+        task_uuid=task_uuid,
+        email_service_type=email_service_type,
+        result=batch_wait_result,
+        next_state="deferred_hold",
+        next_retry_at=next_retry_at,
+    )
 
     crud.update_registration_task_retry_state(
         db,

@@ -20,6 +20,7 @@ from curl_cffi import requests as cffi_requests
 from .openai.oauth import OAuthManager, OAuthStart
 from .http_client import OpenAIHTTPClient, HTTPClientError
 from .registration_failures import classify_registration_failure
+from .mailbox_registry import MailboxRegistry
 from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType
 from ..database import crud
 from ..database.session import get_db
@@ -777,6 +778,12 @@ class RegistrationEngine:
             self.inbox_email = raw_email
             self.email = normalized_email
             self.email_info["email"] = normalized_email
+            MailboxRegistry.mark_created(
+                email=normalized_email,
+                service_type=self.email_service.service_type.value,
+                service_id=self.email_info.get("service_id") if isinstance(self.email_info, dict) else None,
+                task_uuid=self.task_uuid,
+            )
 
             if raw_email and raw_email != normalized_email:
                 self._log(f"邮箱规范化: {raw_email} -> {normalized_email}")
@@ -2835,6 +2842,12 @@ class RegistrationEngine:
                         status="failed",
                         extra_data={"register_failed_reason": "email_already_registered_on_openai"}
                     )
+                    MailboxRegistry.mark_registered_elsewhere(
+                        email=self.email,
+                        service_type=self.email_service.service_type.value,
+                        service_id=self.email_info.get("service_id") if self.email_info else None,
+                        task_uuid=self.task_uuid,
+                    )
                     self._log(f"已在数据库中标记邮箱 {self.email} 为已注册状态")
         except Exception as e:
             logger.warning(f"标记邮箱状态失败: {e}")
@@ -3790,6 +3803,12 @@ class RegistrationEngine:
                     source=result.source,
                     account_label=account_label,
                     role_tag=role_tag,
+                )
+                MailboxRegistry.mark_registered(
+                    email=result.email,
+                    service_type=self.email_service.service_type.value,
+                    service_id=self.email_info.get("service_id") if self.email_info else None,
+                    task_uuid=self.task_uuid,
                 )
 
                 self._log(f"账户已存进数据库，落袋为安，ID: {account.id}")

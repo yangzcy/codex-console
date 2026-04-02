@@ -4,9 +4,18 @@ from tempfile import TemporaryDirectory
 import asyncio
 
 from src.core.register import RegistrationResult
+from src.core.mailbox_registry import MailboxRegistry
 from src.database import crud
 from src.database.session import DatabaseSessionManager
 from src.web.routes import registration as registration_routes
+
+
+def _patch_registry_path(monkeypatch, path: Path) -> None:
+    monkeypatch.setattr(
+        MailboxRegistry,
+        "_registry_path",
+        classmethod(lambda cls: path),
+    )
 
 
 def test_apply_retry_policy_marks_task_deferred(monkeypatch):
@@ -19,6 +28,8 @@ def test_apply_retry_policy_marks_task_deferred(monkeypatch):
 
     with TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "route_retry.db"
+        registry_path = Path(tmpdir) / "mailbox_registry.json"
+        _patch_registry_path(monkeypatch, registry_path)
         manager = DatabaseSessionManager(f"sqlite:///{db_path}")
         manager.create_tables()
         manager.migrate_tables()
@@ -28,6 +39,7 @@ def test_apply_retry_policy_marks_task_deferred(monkeypatch):
             crud.create_registration_task(session, task_uuid="task-defer")
             result = RegistrationResult(
                 success=False,
+                email="deferred@example.com",
                 error_message="等待验证码超时（15 秒）",
                 phase="signup_otp_waiting",
                 reason_code="email_otp_timeout",
@@ -47,6 +59,10 @@ def test_apply_retry_policy_marks_task_deferred(monkeypatch):
             assert task.phase == "signup_otp_waiting"
             assert task.next_retry_at is not None
             assert updates[-1][1] == "deferred"
+            registry_row = MailboxRegistry.get("deferred@example.com")
+            assert registry_row is not None
+            assert registry_row["state"] == "deferred_hold"
+            assert registry_row["last_reason_code"] == "email_otp_timeout"
         finally:
             session.close()
 
@@ -61,6 +77,8 @@ def test_apply_retry_policy_marks_task_failed_after_max_retry(monkeypatch):
 
     with TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "route_retry_fail.db"
+        registry_path = Path(tmpdir) / "mailbox_registry.json"
+        _patch_registry_path(monkeypatch, registry_path)
         manager = DatabaseSessionManager(f"sqlite:///{db_path}")
         manager.create_tables()
         manager.migrate_tables()
@@ -75,23 +93,28 @@ def test_apply_retry_policy_marks_task_failed_after_max_retry(monkeypatch):
             )
             result = RegistrationResult(
                 success=False,
-                error_message="登录收尾失败: 未命中 OAuth 回调",
-                phase="oauth_finish",
-                reason_code="oauth_callback_miss",
+                email="blocked@example.com",
+                error_message="We can't create your account due to our Terms of Use",
+                phase="signup_start",
+                reason_code="registration_disallowed",
             )
 
             outcome = registration_routes._apply_retry_policy_for_failed_task(
                 session,
                 "task-fail",
                 result,
-                "cloud_mail",
+                "freemail",
             )
             task = crud.get_registration_task_by_uuid(session, "task-fail")
 
             assert outcome["outcome"] == "failed"
             assert task.status == "failed"
-            assert task.reason_code == "oauth_callback_miss"
+            assert task.reason_code == "registration_disallowed"
             assert updates[-1][1] == "failed"
+            registry_row = MailboxRegistry.get("blocked@example.com")
+            assert registry_row is not None
+            assert registry_row["state"] == "invalid_hard"
+            assert registry_row["last_reason_code"] == "registration_disallowed"
         finally:
             session.close()
 
