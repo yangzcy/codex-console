@@ -4,7 +4,12 @@ import json
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
-from src.core.register import RegistrationEngine, RegistrationResult, SignupFormResult
+from src.core.register import (
+    REGISTRATION_DISALLOWED_SUBDOMAIN_MESSAGE,
+    RegistrationEngine,
+    RegistrationResult,
+    SignupFormResult,
+)
 from src.services.base import BaseEmailService
 
 
@@ -643,6 +648,52 @@ def test_run_retries_with_fresh_email_when_create_account_reports_existing_user(
     assert created_emails == ["retry-1@example.com", "retry-2@example.com"]
     assert result.email == "retry-2@example.com"
     assert complete_calls == ["retry-2@example.com"]
+
+
+def test_run_preserves_registration_disallowed_reason_when_fresh_email_retries_exhausted():
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine._check_ip_location = lambda: (True, "US")
+
+    created_emails = []
+
+    def fake_create_email():
+        idx = len(created_emails) + 1
+        email = f"retry-{idx}@example.com"
+        created_emails.append(email)
+        engine.email = email
+        engine.inbox_email = email
+        engine.email_info = {"email": email, "service_id": email}
+        return True
+
+    def fake_create_user_account():
+        engine._last_create_account_error_code = "registration_disallowed"
+        engine._last_create_account_error_message = (
+            "Sorry, we cannot create your account with the given information."
+        )
+        return False
+
+    engine._create_email = fake_create_email
+    engine._prepare_authorize_flow = lambda label: ("did-1", "sentinel-1")
+    engine._submit_signup_form = lambda did, sen: SignupFormResult(success=True)
+    engine._register_password = lambda did, sen: (True, "pw-1")
+    engine._send_verification_code = lambda referer=None: True
+    engine._verify_email_otp_with_retry = lambda *args, **kwargs: True
+    engine._create_user_account = fake_create_user_account
+
+    result = engine.run()
+
+    assert result.success is False
+    assert result.reason_code == "registration_disallowed"
+    assert result.error_message == f"{REGISTRATION_DISALLOWED_SUBDOMAIN_MESSAGE} 当前失效域名: example.com"
+    assert created_emails == [
+        "retry-1@example.com",
+        "retry-2@example.com",
+        "retry-3@example.com",
+    ]
+    assert any(
+        REGISTRATION_DISALLOWED_SUBDOMAIN_MESSAGE in message
+        for message in (result.logs or [])
+    )
 
 
 def test_registration_result_to_dict_includes_phase_and_reason_code():

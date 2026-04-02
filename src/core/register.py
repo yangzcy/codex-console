@@ -40,6 +40,7 @@ from ..config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 BATCH_OTP_WAIT_SLICE_DEFAULT_SECONDS = 15
+REGISTRATION_DISALLOWED_SUBDOMAIN_MESSAGE = "当前邮箱子域已经不可用，请尽快更换新子域。"
 
 
 @dataclass
@@ -247,6 +248,48 @@ class RegistrationEngine:
             phase=result.phase or None,
         )
         result.reason_code = decision.reason_code.value
+
+    def _is_registration_disallowed_error(self) -> bool:
+        create_error_code = str(self._last_create_account_error_code or "").strip().lower()
+        create_error_msg = str(self._last_create_account_error_message or "").strip().lower()
+        return (
+            create_error_code == "registration_disallowed"
+            or "cannot create your account with the given information" in create_error_msg
+        )
+
+    def _get_current_email_domain(self) -> str:
+        email_info_domain = str((self.email_info or {}).get("domain") or "").strip().lower()
+        if email_info_domain:
+            return email_info_domain
+
+        current_email = str(self.email or (self.email_info or {}).get("email") or "").strip().lower()
+        if "@" in current_email:
+            return current_email.split("@", 1)[1].strip().lower()
+        return ""
+
+    def _build_registration_disallowed_message(self) -> str:
+        domain = self._get_current_email_domain()
+        if domain:
+            return f"{REGISTRATION_DISALLOWED_SUBDOMAIN_MESSAGE} 当前失效域名: {domain}"
+        return REGISTRATION_DISALLOWED_SUBDOMAIN_MESSAGE
+
+    def _build_fresh_email_retry_notice(self, identity_attempt: int, max_fresh_email_attempts: int) -> str:
+        if self._is_registration_disallowed_error():
+            return (
+                f"{self._build_registration_disallowed_message()}"
+                f" 正在切换新邮箱子域重试（第 {identity_attempt}/{max_fresh_email_attempts} 次）..."
+            )
+        return (
+            f"检测到邮箱已被 OpenAI 占用，切换新邮箱重试注册"
+            f"（第 {identity_attempt}/{max_fresh_email_attempts} 次）..."
+        )
+
+    def _apply_create_account_failure_to_result(self, result: RegistrationResult) -> None:
+        if self._is_registration_disallowed_error():
+            result.error_message = self._build_registration_disallowed_message()
+            result.reason_code = "registration_disallowed"
+            return
+        result.error_message = self._last_create_account_error_message or "创建用户账户失败"
 
     def _should_retry_with_fresh_email(self) -> bool:
         register_error = str(self._last_register_password_error or "").lower()
@@ -3571,11 +3614,14 @@ class RegistrationEngine:
             self._log(f"IP 位置: {location}")
             for identity_attempt in range(1, max_fresh_email_attempts + 1):
                 outcome_reported = False
+                retry_notice = None
+                if identity_attempt > 1:
+                    retry_notice = self._build_fresh_email_retry_notice(identity_attempt, max_fresh_email_attempts)
                 self._reset_registration_attempt_state(close_auth_flow=(identity_attempt > 1))
                 self._set_result_phase(result, "init")
-                if identity_attempt > 1:
+                if retry_notice:
                     self._log(
-                        f"检测到邮箱已被 OpenAI 占用，切换新邮箱重试注册（第 {identity_attempt}/{max_fresh_email_attempts} 次）...",
+                        retry_notice,
                         "warning",
                     )
 
@@ -3662,7 +3708,7 @@ class RegistrationEngine:
                     if not self._create_user_account():
                         should_retry_with_fresh_email = self._should_retry_with_fresh_email()
                         if not should_retry_with_fresh_email or identity_attempt >= max_fresh_email_attempts:
-                            result.error_message = "创建用户账户失败"
+                            self._apply_create_account_failure_to_result(result)
                             return result
 
                     self._set_result_phase(result, "profile_submitted")

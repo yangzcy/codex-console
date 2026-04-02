@@ -71,6 +71,15 @@ function getSingleCompletionMessage(status) {
     return `[警告] 任务已取消，邮箱服务: ${serviceLabel}`;
 }
 
+function getSingleFailureReason(data = null) {
+    return (
+        data?.error
+        || data?.error_message
+        || currentTask?.error_message
+        || '未知原因'
+    );
+}
+
 function getCurrentBatchServiceLabel() {
     if (currentBatch?.email_service_name) {
         return currentBatch.email_service_name;
@@ -846,8 +855,9 @@ function connectWebSocket(taskUuid) {
                             // 刷新账号列表
                             loadRecentAccounts();
                         } else if (data.status === 'failed') {
-                            addLog('error', getSingleCompletionMessage('failed'));
-                            toast.error(`注册失败，邮箱服务: ${getCurrentSingleServiceLabel()}`);
+                            const reason = getSingleFailureReason(data);
+                            addLog('error', `${getSingleCompletionMessage('failed')}，原因: ${reason}`);
+                            toast.error(`注册失败，邮箱服务: ${getCurrentSingleServiceLabel()}，原因: ${reason}`);
                         } else if (data.status === 'cancelled' || data.status === 'cancelling') {
                             addLog('warning', getSingleCompletionMessage('cancelled'));
                         }
@@ -1080,8 +1090,9 @@ function startLogPolling(taskUuid) {
                         // 刷新账号列表
                         loadRecentAccounts();
                     } else if (data.status === 'failed') {
-                        addLog('error', getSingleCompletionMessage('failed'));
-                        toast.error(`注册失败，邮箱服务: ${getCurrentSingleServiceLabel()}`);
+                        const reason = getSingleFailureReason(data);
+                        addLog('error', `${getSingleCompletionMessage('failed')}，原因: ${reason}`);
+                        toast.error(`注册失败，邮箱服务: ${getCurrentSingleServiceLabel()}，原因: ${reason}`);
                     } else if (data.status === 'cancelled') {
                         addLog('warning', getSingleCompletionMessage('cancelled'));
                     }

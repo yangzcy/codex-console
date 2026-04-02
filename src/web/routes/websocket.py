@@ -12,7 +12,7 @@ from ..auth import is_websocket_authenticated, websocket_auth_failure
 from ..task_manager import task_manager
 from ...database import crud
 from ...database.session import get_db
-from .registration import _request_batch_cancel
+from .registration import _finalize_cancelled_task, _request_batch_cancel
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -75,23 +75,16 @@ async def task_websocket(websocket: WebSocket, task_uuid: str):
                 # 处理取消请求
                 elif data.get("type") == "cancel":
                     task_manager.cancel_task(task_uuid)
+                    task_manager.update_status(task_uuid, "cancelling", error="用户手动取消任务")
                     with get_db() as db:
                         task = crud.get_registration_task(db, task_uuid)
                         if task and task.status in {"pending", "running"}:
-                            crud.update_registration_task(
+                            _finalize_cancelled_task(
                                 db,
                                 task_uuid,
-                                status="cancelled",
-                                completed_at=datetime.utcnow(),
-                                error_message="用户通过页面取消任务",
+                                default_reason="用户手动取消任务",
+                                task=task,
                             )
-                    task_manager.update_status(task_uuid, "cancelling", error="用户通过页面取消任务")
-                    await websocket.send_json({
-                        "type": "status",
-                        "task_uuid": task_uuid,
-                        "status": "cancelling",
-                        "message": "取消请求已提交，正在踩刹车，别慌"
-                    })
 
             except asyncio.TimeoutError:
                 # 超时，发送心跳检测

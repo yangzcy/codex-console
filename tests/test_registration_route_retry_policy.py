@@ -204,6 +204,96 @@ def test_gate_task_execution_allows_non_deferred_task():
         assert outcome is None
 
 
+def test_finalize_cancelled_task_preserves_existing_reason(monkeypatch):
+    updates = []
+    monkeypatch.setattr(
+        registration_routes.task_manager,
+        "update_status",
+        lambda task_uuid, status, **kwargs: updates.append((task_uuid, status, kwargs)),
+    )
+
+    with TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "route_cancel_preserve.db"
+        manager = DatabaseSessionManager(f"sqlite:///{db_path}")
+        manager.create_tables()
+        manager.migrate_tables()
+
+        session = manager.SessionLocal()
+        try:
+            crud.create_registration_task(session, task_uuid="task-cancel-preserve")
+            original = crud.update_registration_task(
+                session,
+                "task-cancel-preserve",
+                status="cancelled",
+                error_message="用户手动取消任务",
+                completed_at=datetime.utcnow(),
+            )
+
+            _, final_reason = registration_routes._finalize_cancelled_task(
+                session,
+                "task-cancel-preserve",
+                default_reason="任务已取消",
+                task=original,
+            )
+            task = crud.get_registration_task_by_uuid(session, "task-cancel-preserve")
+
+            assert final_reason == "用户手动取消任务"
+            assert task.status == "cancelled"
+            assert task.error_message == "用户手动取消任务"
+            assert updates[-1][1] == "cancelled"
+            assert updates[-1][2]["error"] == "用户手动取消任务"
+        finally:
+            session.close()
+
+
+def test_cancel_task_endpoint_reason_is_not_overwritten_by_followup_finalize(monkeypatch):
+    status_updates = []
+    monkeypatch.setattr(
+        registration_routes.task_manager,
+        "cancel_task",
+        lambda task_uuid: None,
+    )
+    monkeypatch.setattr(
+        registration_routes.task_manager,
+        "update_status",
+        lambda task_uuid, status, **kwargs: status_updates.append((task_uuid, status, kwargs)),
+    )
+
+    with TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "route_cancel_endpoint.db"
+        manager = DatabaseSessionManager(f"sqlite:///{db_path}")
+        manager.create_tables()
+        manager.migrate_tables()
+
+        original_get_db = registration_routes.get_db
+        registration_routes.get_db = lambda: manager.session_scope()
+        session = manager.SessionLocal()
+        try:
+            crud.create_registration_task(session, task_uuid="task-cancel-endpoint")
+
+            asyncio.run(registration_routes.cancel_task("task-cancel-endpoint"))
+            task_after_endpoint = crud.get_registration_task_by_uuid(session, "task-cancel-endpoint")
+            assert task_after_endpoint.status == "cancelled"
+            assert task_after_endpoint.error_message == "用户手动取消任务"
+
+            _, final_reason = registration_routes._finalize_cancelled_task(
+                session,
+                "task-cancel-endpoint",
+                default_reason="任务已取消",
+            )
+            task_after_followup = crud.get_registration_task_by_uuid(session, "task-cancel-endpoint")
+
+            assert final_reason == "用户手动取消任务"
+            assert task_after_followup.status == "cancelled"
+            assert task_after_followup.error_message == "用户手动取消任务"
+            assert "cancelling" in [entry[1] for entry in status_updates]
+            assert status_updates[-1][1] == "cancelled"
+            assert status_updates[-1][2]["error"] == "用户手动取消任务"
+        finally:
+            registration_routes.get_db = original_get_db
+            session.close()
+
+
 def test_task_to_response_includes_retry_state(monkeypatch):
     class DummyTask:
         id = 1

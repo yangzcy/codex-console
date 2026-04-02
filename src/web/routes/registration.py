@@ -557,6 +557,37 @@ def _make_task_execution_outcome(outcome: str, error: str = "", email: str = "")
     }
 
 
+def _finalize_cancelled_task(
+    db,
+    task_uuid: str,
+    *,
+    default_reason: str = "用户手动取消任务",
+    task=None,
+):
+    """统一任务取消收尾，保留首个已写入的取消原因。"""
+    current_task = task or crud.get_registration_task_by_uuid(db, task_uuid)
+    final_reason = str(default_reason or "").strip() or "用户手动取消任务"
+    completed_at = datetime.utcnow()
+
+    if current_task:
+        existing_reason = str(getattr(current_task, "error_message", "") or "").strip()
+        if existing_reason:
+            final_reason = existing_reason
+        existing_completed_at = getattr(current_task, "completed_at", None)
+        if existing_completed_at:
+            completed_at = existing_completed_at
+
+    updated_task = crud.update_registration_task(
+        db,
+        task_uuid,
+        status="cancelled",
+        completed_at=completed_at,
+        error_message=final_reason,
+    )
+    task_manager.update_status(task_uuid, "cancelled", error=final_reason)
+    return updated_task, final_reason
+
+
 def _gate_task_execution_by_retry_window(task_uuid: str):
     with get_db() as db:
         task = crud.get_registration_task_by_uuid(db, task_uuid)
@@ -641,6 +672,11 @@ def _apply_retry_policy_for_failed_task(
                 int(getattr(task, "context_version", 0) or 0)
                 + (1 if (action.should_rotate_email_context or action.should_rotate_identity_context or action.should_rotate_proxy_context) else 0)
             ),
+        )
+        crud.update_registration_task(
+            db,
+            task_uuid,
+            error_message=result.error_message,
         )
         task_manager.update_status(
             task_uuid,
@@ -840,14 +876,12 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
             # 检查是否已取消
             if task_manager.is_cancelled(task_uuid):
                 logger.info(f"任务 {task_uuid} 已取消，跳过执行")
-                crud.update_registration_task(
-                    db, task_uuid,
-                    status="cancelled",
-                    completed_at=datetime.utcnow(),
-                    error_message="任务已取消",
+                _, reason = _finalize_cancelled_task(
+                    db,
+                    task_uuid,
+                    default_reason="用户手动取消任务",
                 )
-                task_manager.update_status(task_uuid, "cancelled", error="任务已取消")
-                return _make_task_execution_outcome("cancelled", error="任务已取消")
+                return _make_task_execution_outcome("cancelled", error=reason)
 
             # 更新任务状态为运行中
             task = crud.update_registration_task(
@@ -1045,14 +1079,11 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
             result = engine.run()
 
             if task_manager.is_cancelled(task_uuid) and not result.success:
-                reason = "任务已取消"
-                crud.update_registration_task(
-                    db, task_uuid,
-                    status="cancelled",
-                    completed_at=datetime.utcnow(),
-                    error_message=reason,
+                _, reason = _finalize_cancelled_task(
+                    db,
+                    task_uuid,
+                    default_reason="用户手动取消任务",
                 )
-                task_manager.update_status(task_uuid, "cancelled", error=reason)
                 logger.info(f"任务 {task_uuid} 在执行后检测到取消请求，按取消收尾")
                 return _make_task_execution_outcome("cancelled", error=reason)
 
@@ -1188,14 +1219,11 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
             else:
                 # 更新任务状态为失败
                 if task_manager.is_cancelled(task_uuid):
-                    reason = "任务已取消"
-                    crud.update_registration_task(
-                        db, task_uuid,
-                        status="cancelled",
-                        completed_at=datetime.utcnow(),
-                        error_message=reason
+                    _, reason = _finalize_cancelled_task(
+                        db,
+                        task_uuid,
+                        default_reason="用户手动取消任务",
                     )
-                    task_manager.update_status(task_uuid, "cancelled", error=reason)
                     logger.info(f"注册任务取消收尾: {task_uuid}")
                     return _make_task_execution_outcome("cancelled", error=reason)
 
@@ -1900,12 +1928,11 @@ async def cancel_task(task_uuid: str):
 
         task_manager.cancel_task(task_uuid)
         task_manager.update_status(task_uuid, "cancelling", error="用户手动取消任务")
-        task = crud.update_registration_task(
+        task, _ = _finalize_cancelled_task(
             db,
             task_uuid,
-            status="cancelled",
-            completed_at=datetime.utcnow(),
-            error_message="用户手动取消任务",
+            default_reason="用户手动取消任务",
+            task=task,
         )
 
         return {"success": True, "message": "任务已取消"}
