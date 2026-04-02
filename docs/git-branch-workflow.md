@@ -1,25 +1,25 @@
-# Git Branch Workflow
+# Git 分支工作流
 
-## Purpose
+## 目的
 
-This repo now uses a simple two-branch workflow:
+当前仓库采用简洁的双分支开发方式：
 
-- `main`: stable, deployable, release-ready code
-- `dev`: daily development branch
+- `main`：稳定、可部署、可发布的正式分支
+- `dev`：日常开发分支
 
-Use `dev` for normal work. Only merge into `main` after validation.
+平时所有开发都先提交到 `dev`，验证没问题后再合并到 `main`。
 
-## Current Milestone
+## 当前里程碑
 
-The current important milestone has been tagged as:
+当前重要节点已经打上标签：
 
 - `milestone-2026-04-02`
 
-This tag points to the repository state before switching to the long-term `dev -> main` workflow.
+这个标签对应的是切换到长期 `dev -> main` 工作流之前的仓库状态，可作为后续回滚或对照基线。
 
-## Daily Development Flow
+## 日常开发流程
 
-Always start development on `dev`:
+开始开发前，先切到 `dev` 并同步远程：
 
 ```bash
 cd /root/codex-console
@@ -27,17 +27,17 @@ git checkout dev
 git pull userrepo dev
 ```
 
-After making changes:
+完成修改后提交到 `dev`：
 
 ```bash
 git add .
-git commit -m "feat: your change"
+git commit -m "feat: 你的改动说明"
 git push userrepo dev
 ```
 
-## Release Flow
+## 发布流程
 
-When `dev` has been tested and is ready to release:
+当 `dev` 已经验证完成、可以发布时，再合并到 `main`：
 
 ```bash
 cd /root/codex-console
@@ -47,47 +47,47 @@ git merge --no-ff dev
 git push userrepo main
 ```
 
-Recommended:
+建议遵循以下原则：
 
-- Keep `main` always deployable
-- Do not develop directly on `main`
-- Use `--no-ff` so each merge back to `main` stays visible in history
+- `main` 始终保持可部署状态
+- 不要直接在 `main` 上开发
+- 合并时保留 `--no-ff`，这样每次从 `dev` 回到 `main` 的记录都清晰可见
 
-## Milestone Tagging
+## 里程碑打标
 
-Before a major refactor or risky change, create a tag on the current stable state:
+在进行大改版、高风险调整或重要阶段收口前，建议先对当前稳定版本打标签：
 
 ```bash
 git checkout main
 git pull userrepo main
-git tag -a milestone-YYYY-MM-DD -m "milestone note"
+git tag -a milestone-YYYY-MM-DD -m "里程碑说明"
 git push userrepo milestone-YYYY-MM-DD
 ```
 
-## Rollback
+## 回滚方式
 
-If a release on `main` is bad, first locate the last good point:
+如果 `main` 上线后的版本有问题，先定位最近一个可用节点：
 
 ```bash
 git log --oneline --decorate --graph -n 30
 git tag --list "milestone-*"
 ```
 
-Then either:
+然后按情况选择：
 
-- revert the bad merge commit, or
-- redeploy a known-good tagged commit
+- 回退出问题的合并提交
+- 重新部署某个已确认正常的标签版本
 
-Avoid `git reset --hard` on shared branches unless you fully understand the impact.
+除非你完全明确影响范围，否则不要在共享分支上直接使用 `git reset --hard`。
 
-## Remote Setup
+## 远程仓库配置
 
-Current remotes:
+当前远程仓库的含义：
 
-- `userrepo`: your GitHub repo
-- `upstream`: original upstream repo
+- `userrepo`：你的 GitHub 仓库
+- `upstream`：原始上游仓库
 
-Typical sync pattern:
+常用同步方式：
 
 ```bash
 git checkout main
@@ -95,41 +95,39 @@ git fetch upstream
 git fetch userrepo
 ```
 
-If you want to absorb upstream updates later, do that deliberately on `dev` first, not directly on `main`.
+如果后续需要吸收上游更新，建议先在 `dev` 上处理和验证，不要直接在 `main` 上操作。
 
-## GitHub Authentication
+## GitHub 认证
 
-This server currently has no working GitHub HTTPS credentials, so `git push` fails.
+这台服务器向 GitHub 推送代码时，需要可用的认证信息。最简单的方式是使用带仓库权限的 GitHub Personal Access Token。
 
-The simplest setup is a GitHub Personal Access Token with repo permission.
+### 方式一：HTTPS + PAT
 
-### Option 1: HTTPS + PAT
-
-1. Create a GitHub Personal Access Token.
-2. Recommended minimum scope:
-   - Fine-grained token: access only the target repo, with `Contents: Read and write`
-   - Classic token: `repo`
-3. Configure credential storage on this machine:
+1. 创建一个 GitHub Personal Access Token。
+2. 建议最小权限如下：
+   - Fine-grained Token：仅授权目标仓库，并赋予 `Contents: Read and write`
+   - Classic Token：授予 `repo`
+3. 在当前机器上启用凭据保存：
 
 ```bash
 git config --global credential.helper store
 ```
 
-4. On the first push, Git will ask:
-   - Username: your GitHub username
-   - Password: paste the PAT, not your GitHub login password
+4. 第一次 `git push` 时，Git 会要求输入：
+   - Username：你的 GitHub 用户名
+   - Password：填写 PAT，不是 GitHub 登录密码
 
-5. Git will save the credential to:
+5. 凭据会保存到：
 
 ```bash
 /root/.git-credentials
 ```
 
-After that, pushes should work normally.
+后续再推送通常就不需要重复输入。
 
-### Option 2: Preload Credential Non-Interactively
+### 方式二：手动预写入凭据
 
-If you want to write the credential once:
+如果你想一次性手动写入凭据：
 
 ```bash
 printf 'https://YOUR_GITHUB_USERNAME:YOUR_GITHUB_PAT@github.com\n' > /root/.git-credentials
@@ -137,27 +135,27 @@ chmod 600 /root/.git-credentials
 git config --global credential.helper store
 ```
 
-Replace:
+把下面两项替换成你自己的信息：
 
 - `YOUR_GITHUB_USERNAME`
 - `YOUR_GITHUB_PAT`
 
-### Option 3: SSH
+### 方式三：SSH
 
-If you prefer SSH, switch the remote URL and configure a deploy key or personal SSH key:
+如果你更倾向于 SSH，可以把远程地址改成 SSH 形式，并配置部署密钥或个人 SSH Key：
 
 ```bash
 git remote set-url userrepo git@github.com:yangzcy/codex-console.git
 ```
 
-Then ensure the machine key is added to your GitHub account.
+然后把这台机器对应的公钥添加到你的 GitHub 账号中。
 
-## Recommended Branch Protection
+## 建议的分支保护
 
-On GitHub, protect `main`:
+建议在 GitHub 上对 `main` 开启保护：
 
-- disable direct pushes
-- require PR or controlled merge process
-- keep `dev` as the branch for ongoing work
+- 禁止直接推送
+- 要求通过 PR 或受控合并流程进入 `main`
+- 将 `dev` 作为持续开发分支
 
-For a small private workflow, even without PRs, protecting `main` is still useful.
+即使是小型私有项目，不走完整 PR 流程，保护 `main` 也依然有价值。
