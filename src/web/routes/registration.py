@@ -516,6 +516,9 @@ def _gate_task_execution_by_retry_window(task_uuid: str):
         task = crud.get_registration_task_by_uuid(db, task_uuid)
         if not task:
             return True, None
+        task_status = str(getattr(task, "status", "") or "").strip().lower()
+        if task_status != "deferred":
+            return True, None
         if not should_run_deferred_task(task, now=datetime.utcnow()):
             next_retry_at = getattr(task, "next_retry_at", None)
             reason = str(getattr(task, "error_message", "") or "任务尚未到达下一次重试时间").strip()

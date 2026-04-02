@@ -157,6 +157,30 @@ def test_run_registration_task_skips_deferred_task_before_next_retry(monkeypatch
         assert updates[-1][1] == "deferred"
 
 
+def test_gate_task_execution_allows_non_deferred_task():
+    with TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "route_retry_gate_pending.db"
+        manager = DatabaseSessionManager(f"sqlite:///{db_path}")
+        manager.create_tables()
+        manager.migrate_tables()
+
+        session = manager.SessionLocal()
+        try:
+            crud.create_registration_task(session, task_uuid="task-pending")
+        finally:
+            session.close()
+
+        original_get_db = registration_routes.get_db
+        registration_routes.get_db = lambda: manager.session_scope()
+        try:
+            can_run, outcome = registration_routes._gate_task_execution_by_retry_window("task-pending")
+        finally:
+            registration_routes.get_db = original_get_db
+
+        assert can_run is True
+        assert outcome is None
+
+
 def test_task_to_response_includes_retry_state(monkeypatch):
     class DummyTask:
         id = 1
