@@ -7,6 +7,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 
+## 开发流程
+
+- Git 分支与发布流程: [docs/git-branch-workflow.md](docs/git-branch-workflow.md)
+
 ## QQ群
 
 - 交流群: https://qm.qq.com/q/ZTCKxawxeo
