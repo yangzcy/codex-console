@@ -192,5 +192,6 @@ git remote set-url userrepo git@github.com:yangzcy/codex-console.git
 - 要求通过 Pull Request 合并进入 `main`
 - 将 `dev` 作为持续开发分支
 - 对管理员同样生效，避免误操作绕过保护
+- 要求通过 `allow-only-dev-to-main` 状态检查，确保只有 `dev -> main` 能合并
 
 即使是小型私有项目，不走完整 PR 流程，保护 `main` 也依然有价值。
