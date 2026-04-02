@@ -173,6 +173,7 @@ class FreemailService(BaseEmailService):
         self._stage_seen_mail_ids: Dict[str, set] = {}
         # 跨阶段记录最近一次真正消费过的邮件，避免登录阶段再次捡到注册阶段旧邮件
         self._last_used_mail_ids: Dict[str, str] = {}
+        self._last_runtime_metrics: Dict[str, Any] = {}
 
     @staticmethod
     def _health_store_path() -> Path:
@@ -443,6 +444,9 @@ class FreemailService(BaseEmailService):
     def get_domain_health_snapshot(self) -> Dict[str, Any]:
         return self._collect_domain_health_snapshot()
 
+    def get_runtime_metrics(self) -> Dict[str, Any]:
+        return dict(self._last_runtime_metrics or {})
+
     def _get_headers(self) -> Dict[str, str]:
         """构造 admin 请求头"""
         return {
@@ -590,6 +594,11 @@ class FreemailService(BaseEmailService):
                         "domain": selected_domain,
                         "domain_health_snapshot": self._collect_domain_health_snapshot(specified_domain),
                     }
+                    self._last_runtime_metrics = {
+                        "service_type": self.service_type.value,
+                        "selected_domain": selected_domain,
+                        "create_email_status": "success",
+                    }
 
                     logger.info(f"成功创建 Freemail 邮箱: {email}")
                     self.update_status(True)
@@ -597,6 +606,12 @@ class FreemailService(BaseEmailService):
                 except Exception as e:
                     last_error = e
                     self.update_status(False, e)
+                    self._last_runtime_metrics = {
+                        "service_type": self.service_type.value,
+                        "selected_domain": selected_domain,
+                        "create_email_status": "failed",
+                        "create_email_error": str(e or ""),
+                    }
                     self.report_registration_outcome(
                         f"probe@{selected_domain}",
                         success=False,
@@ -647,10 +662,12 @@ class FreemailService(BaseEmailService):
         last_used_mail_id = str(self._last_used_mail_ids.get(email) or "").strip()
         last_error: Optional[Exception] = None
         warned_payload_shape = False
+        poll_count = 0
         unknown_ts_grace_seconds = max(6, int(min(timeout, max(poll_interval * 3, 6))))
 
         while time.time() - start_time < timeout:
             try:
+                poll_count += 1
                 response_data = self._make_request("GET", "/api/emails", params={"mailbox": email, "limit": 20})
                 mails = _extract_mail_list(response_data)
                 if not mails:
@@ -784,6 +801,17 @@ class FreemailService(BaseEmailService):
                     best_mail_id = str(best["mail_id"])
                     seen_mail_ids.add(best_mail_id)
                     self._last_used_mail_ids[email] = best_mail_id
+                    self._last_runtime_metrics = {
+                        "service_type": self.service_type.value,
+                        "mailbox_email": email,
+                        "otp_poll_count": poll_count,
+                        "mail_list_size": len(mails),
+                        "seen_mail_count": len(seen_mail_ids),
+                        "selected_mail_id": best_mail_id,
+                        "selected_mail_has_timestamp": bool(best.get("has_ts")),
+                        "selected_mail_is_recent": bool(best.get("is_recent")),
+                        "otp_fetch_status": "success",
+                    }
                     logger.info(
                         "从 Freemail 邮箱 %s 找到验证码: %s（mail_id=%s ts=%s recent=%s）",
                         email,
@@ -797,6 +825,14 @@ class FreemailService(BaseEmailService):
 
             except Exception as e:
                 last_error = e
+                self._last_runtime_metrics = {
+                    "service_type": self.service_type.value,
+                    "mailbox_email": email,
+                    "otp_poll_count": poll_count,
+                    "seen_mail_count": len(seen_mail_ids),
+                    "otp_fetch_status": "error",
+                    "otp_fetch_error": str(e or ""),
+                }
                 logger.warning(f"检查 Freemail 邮件时出错: {email} - {e}")
 
             time.sleep(poll_interval)
@@ -805,6 +841,13 @@ class FreemailService(BaseEmailService):
             logger.warning(f"等待 Freemail 验证码超时: {email}，最后一次错误: {last_error}")
         else:
             logger.warning(f"等待 Freemail 验证码超时: {email}")
+        self._last_runtime_metrics = {
+            "service_type": self.service_type.value,
+            "mailbox_email": email,
+            "otp_poll_count": poll_count,
+            "seen_mail_count": len(seen_mail_ids),
+            "otp_fetch_status": "timeout",
+        }
         return None
 
     def list_emails(self, **kwargs) -> List[Dict[str, Any]]:

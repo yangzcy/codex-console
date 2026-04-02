@@ -179,6 +179,46 @@ function updateTaskServiceLabel(task = null) {
         : '-';
 }
 
+function getTaskRuntimeMetrics(task = null) {
+    if (task?.email_service_runtime_metrics && typeof task.email_service_runtime_metrics === 'object') {
+        return task.email_service_runtime_metrics;
+    }
+    if (task?.result?.metadata?.email_service_runtime_metrics && typeof task.result.metadata.email_service_runtime_metrics === 'object') {
+        return task.result.metadata.email_service_runtime_metrics;
+    }
+    return {};
+}
+
+function updateTaskDiagnostics(task = null) {
+    const metrics = getTaskRuntimeMetrics(task);
+    const selectedDomain = task?.email_service_selected_domain
+        || task?.result?.metadata?.email_service_selected_domain
+        || metrics.selected_domain
+        || '-';
+    const createEmailStatus = metrics.create_email_status || '-';
+    const otpFetchStatus = metrics.otp_fetch_status || '-';
+    const otpPollCount = Number.isFinite(metrics.otp_poll_count) ? String(metrics.otp_poll_count) : '-';
+    const mailListSize = Number.isFinite(metrics.mail_list_size) ? String(metrics.mail_list_size) : '-';
+    const selectedMailId = metrics.selected_mail_id || '-';
+
+    const hasDiagnostic = [
+        selectedDomain,
+        createEmailStatus,
+        otpFetchStatus,
+        otpPollCount,
+        mailListSize,
+        selectedMailId,
+    ].some(value => value && value !== '-');
+
+    elements.taskSelectedDomain.textContent = selectedDomain;
+    elements.taskCreateEmailStatus.textContent = createEmailStatus;
+    elements.taskOtpFetchStatus.textContent = otpFetchStatus;
+    elements.taskOtpPollCount.textContent = otpPollCount;
+    elements.taskMailListSize.textContent = mailListSize;
+    elements.taskSelectedMailId.textContent = selectedMailId;
+    elements.taskDiagnosticPanel.style.display = hasDiagnostic ? 'grid' : 'none';
+}
+
 // DOM 元素
 const elements = {
     form: document.getElementById('registration-form'),
@@ -193,6 +233,7 @@ const elements = {
     startBtn: document.getElementById('start-btn'),
     cancelBtn: document.getElementById('cancel-btn'),
     taskStatusRow: document.getElementById('task-status-row'),
+    taskDiagnosticPanel: document.getElementById('task-diagnostic-panel'),
     batchProgressSection: document.getElementById('batch-progress-section'),
     consoleLog: document.getElementById('console-log'),
     clearLogBtn: document.getElementById('clear-log-btn'),
@@ -202,6 +243,12 @@ const elements = {
     taskStatus: document.getElementById('task-status'),
     taskService: document.getElementById('task-service'),
     taskStatusBadge: document.getElementById('task-status-badge'),
+    taskSelectedDomain: document.getElementById('task-selected-domain'),
+    taskCreateEmailStatus: document.getElementById('task-create-email-status'),
+    taskOtpFetchStatus: document.getElementById('task-otp-fetch-status'),
+    taskOtpPollCount: document.getElementById('task-otp-poll-count'),
+    taskMailListSize: document.getElementById('task-mail-list-size'),
+    taskSelectedMailId: document.getElementById('task-selected-mail-id'),
     // 批量状态
     batchProgressText: document.getElementById('batch-progress-text'),
     batchProgressPercent: document.getElementById('batch-progress-percent'),
@@ -735,6 +782,7 @@ async function refreshTaskSummary(taskUuid) {
             elements.taskEmail.textContent = data.email;
         }
         updateTaskServiceLabel(currentTask);
+        updateTaskDiagnostics(currentTask);
     } catch (error) {
         console.error('刷新任务摘要失败:', error);
     }
@@ -774,6 +822,7 @@ function connectWebSocket(taskUuid) {
                 if (data.email_service) {
                     elements.taskService.textContent = getServiceTypeText(data.email_service);
                 }
+                updateTaskDiagnostics({ ...(currentTask || {}), ...data });
 
                 // 检查是否完成
                 if (['completed', 'failed', 'cancelled', 'cancelling'].includes(data.status)) {
@@ -1005,6 +1054,7 @@ function startLogPolling(taskUuid) {
                 elements.taskEmail.textContent = data.email;
             }
             updateTaskServiceLabel(data);
+            updateTaskDiagnostics(data);
 
             // 添加新日志
             const logs = data.logs || [];
@@ -1091,6 +1141,7 @@ function showTaskStatus(task) {
     elements.taskId.textContent = task.task_uuid.substring(0, 8) + '...';
     elements.taskEmail.textContent = task?.email || '-';
     updateTaskServiceLabel(task);
+    updateTaskDiagnostics(task);
 }
 
 // 更新任务状态
@@ -1113,6 +1164,7 @@ function updateTaskStatus(status) {
 function showBatchStatus(batch) {
     elements.batchProgressSection.style.display = 'block';
     elements.taskStatusRow.style.display = 'none';
+    elements.taskDiagnosticPanel.style.display = 'none';
     elements.taskStatusBadge.style.display = 'none';
     elements.batchProgressText.textContent = `0/${batch.count}`;
     elements.batchProgressPercent.textContent = '0%';

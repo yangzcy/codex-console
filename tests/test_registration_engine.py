@@ -63,6 +63,7 @@ class FakeEmailService(BaseEmailService):
         super().__init__(EmailServiceType.TEMPMAIL)
         self.codes = list(codes)
         self.otp_requests = []
+        self.runtime_metrics = {}
 
     def create_email(self, config=None):
         return {
@@ -98,6 +99,9 @@ class FakeEmailService(BaseEmailService):
 
     def check_health(self):
         return True
+
+    def get_runtime_metrics(self):
+        return dict(self.runtime_metrics or {})
 
 
 class FakeOAuthManager:
@@ -654,3 +658,24 @@ def test_registration_result_to_dict_includes_phase_and_reason_code():
 
     assert payload["phase"] == "signup_otp_waiting"
     assert payload["reason_code"] == "email_otp_timeout"
+
+
+def test_merge_email_service_runtime_metadata_includes_selected_domain_and_runtime_metrics():
+    email_service = FakeEmailService([])
+    email_service.runtime_metrics = {
+        "otp_fetch_status": "success",
+        "otp_poll_count": 2,
+    }
+    engine = RegistrationEngine(email_service)
+    engine.email_info = {
+        "email": "tester@example.com",
+        "service_id": "mailbox-1",
+        "domain": "a.example.com",
+    }
+    result = RegistrationResult(success=False)
+
+    engine._merge_email_service_runtime_metadata(result)
+
+    assert result.metadata["email_service_selected_domain"] == "a.example.com"
+    assert result.metadata["email_service_runtime_metrics"]["otp_fetch_status"] == "success"
+    assert result.metadata["email_service_runtime_metrics"]["otp_poll_count"] == 2

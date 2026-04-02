@@ -285,3 +285,33 @@ def test_create_email_falls_back_to_next_candidate_and_records_domain_failure(mo
     assert [call["kwargs"].get("params", {}).get("domainIndex") for call in service.http_client.calls] == [0, 1]
     assert snapshot["domain_states"]["a.example.com"]["fail_count"] == 1
     assert snapshot["domain_states"]["a.example.com"]["last_outcome"] == "mailbox_create_failed"
+
+
+def test_get_verification_code_records_runtime_metrics():
+    service = FreemailService({
+        "base_url": "https://mail.example.com",
+        "admin_token": "token-123",
+        "domain": "example.com",
+    })
+    service.http_client = FakeHTTPClient([
+        FakeResponse(
+            payload=[
+                {
+                    "id": 101,
+                    "sender": "otp@tm1.openai.com",
+                    "subject": "Your ChatGPT code is 123456",
+                    "received_at": "2026-03-25 05:50:19",
+                    "verification_code": "123456",
+                }
+            ]
+        )
+    ])
+
+    code = service.get_verification_code("tester@example.com", timeout=1, poll_interval=1)
+    metrics = service.get_runtime_metrics()
+
+    assert code == "123456"
+    assert metrics["otp_fetch_status"] == "success"
+    assert metrics["mailbox_email"] == "tester@example.com"
+    assert metrics["selected_mail_id"] == "101"
+    assert metrics["otp_poll_count"] >= 1

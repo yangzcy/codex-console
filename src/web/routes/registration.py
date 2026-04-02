@@ -306,6 +306,8 @@ class RegistrationTaskResponse(BaseModel):
     email_service: Optional[str] = None
     email_service_name: Optional[str] = None
     email: Optional[str] = None
+    email_service_selected_domain: Optional[str] = None
+    email_service_runtime_metrics: Optional[dict] = None
     proxy: Optional[str] = None
     logs: Optional[str] = None
     result: Optional[dict] = None
@@ -390,6 +392,10 @@ def task_to_response(task: RegistrationTask, db=None) -> RegistrationTaskRespons
     """转换任务模型为响应"""
     email_service, email_service_name = _resolve_task_email_service(task, db=db)
     email = _resolve_task_email(task)
+    result = task.result if isinstance(task.result, dict) else {}
+    metadata = result.get("metadata") if isinstance(result, dict) else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
 
     return RegistrationTaskResponse(
         id=task.id,
@@ -399,9 +405,11 @@ def task_to_response(task: RegistrationTask, db=None) -> RegistrationTaskRespons
         email_service=email_service,
         email_service_name=email_service_name,
         email=email,
+        email_service_selected_domain=str(metadata.get("email_service_selected_domain") or "").strip() or None,
+        email_service_runtime_metrics=metadata.get("email_service_runtime_metrics") if isinstance(metadata.get("email_service_runtime_metrics"), dict) else None,
         proxy=task.proxy,
         logs=task.logs,
-        result=task.result,
+        result=result or task.result,
         error_message=task.error_message,
         phase=getattr(task, "phase", None),
         reason_code=getattr(task, "reason_code", None),
@@ -903,6 +911,20 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         logger.info(f"使用数据库 Freemail 服务: {db_service.name}")
                     else:
                         raise ValueError("没有可用的 Freemail 邮箱服务，请先在邮箱服务页面添加服务")
+                elif service_type in (EmailServiceType.CLOUD_MAIL, EmailServiceType.CLOUDMAIL):
+                    from ...database.models import EmailService as EmailServiceModel
+
+                    db_service = db.query(EmailServiceModel).filter(
+                        EmailServiceModel.service_type == "cloud_mail",
+                        EmailServiceModel.enabled == True
+                    ).order_by(EmailServiceModel.priority.asc()).first()
+
+                    if db_service and db_service.config:
+                        config = _normalize_email_service_config(service_type, db_service.config)
+                        crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
+                        logger.info(f"使用数据库 CloudMail 服务: {db_service.name}")
+                    else:
+                        raise ValueError("没有可用的 CloudMail 邮箱服务，请先在邮箱服务页面添加服务")
                 elif service_type == EmailServiceType.IMAP_MAIL:
                     from ...database.models import EmailService as EmailServiceModel
 
@@ -1772,6 +1794,12 @@ async def get_task_logs(task_uuid: str):
             "email": email or _resolve_task_email(task),
             "email_service": service_type or email_service,
             "email_service_name": email_service_name,
+            "email_service_selected_domain": str((result.get("metadata") or {}).get("email_service_selected_domain") or "").strip() or None,
+            "email_service_runtime_metrics": (
+                (result.get("metadata") or {}).get("email_service_runtime_metrics")
+                if isinstance((result.get("metadata") or {}).get("email_service_runtime_metrics"), dict)
+                else None
+            ),
             "logs": logs.split("\n") if logs else []
         }
 

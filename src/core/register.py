@@ -558,6 +558,9 @@ class RegistrationEngine:
         snapshot = {}
         if isinstance(self.email_info, dict):
             snapshot = dict(self.email_info.get("domain_health_snapshot") or {})
+            selected_domain = str(self.email_info.get("domain") or "").strip()
+            if selected_domain:
+                metadata["email_service_selected_domain"] = selected_domain
         if not snapshot:
             try:
                 snapshot = dict(self.email_service.get_domain_health_snapshot() or {})
@@ -565,12 +568,20 @@ class RegistrationEngine:
                 self._log(f"读取邮箱服务域名状态失败: {exc}", "warning")
                 snapshot = {}
 
+        try:
+            runtime_metrics = dict(self.email_service.get_runtime_metrics() or {})
+        except Exception as exc:
+            self._log(f"读取邮箱服务运行时观测指标失败: {exc}", "warning")
+            runtime_metrics = {}
+
         if snapshot:
             metadata["email_service_domain_health"] = snapshot
             cooldown_domains = list(snapshot.get("cooldown_domains") or [])
             metadata["email_service_cooldown_domains"] = cooldown_domains
             metadata["email_service_has_available_domains"] = bool(snapshot.get("has_available_domains"))
             metadata["email_service_available_domains"] = list(snapshot.get("available_domains") or [])
+        if runtime_metrics:
+            metadata["email_service_runtime_metrics"] = runtime_metrics
         result.metadata = metadata
 
     def _dump_session_cookies(self) -> str:

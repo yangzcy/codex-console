@@ -208,3 +208,32 @@ def test_get_verification_code_skips_last_consumed_mail_across_stages(monkeypatc
 
     assert code_1 == "111111"
     assert code_2 == "222222"
+
+
+def test_get_verification_code_records_runtime_metrics(monkeypatch):
+    _reset_cloud_mail_state()
+    service = _make_service()
+
+    def fake_make_request(method, path, **kwargs):
+        return {
+            "code": 200,
+            "data": [
+                {
+                    "emailId": "12",
+                    "sendEmail": "otp@tm1.openai.com",
+                    "subject": "Your ChatGPT code is 333333",
+                    "createdAt": "2026-03-25T06:01:18+00:00",
+                },
+            ],
+        }
+
+    monkeypatch.setattr(service, "_make_request", fake_make_request)
+
+    code = service.get_verification_code("tester@example.com", timeout=1, otp_sent_at=1000, poll_interval=0)
+    metrics = service.get_runtime_metrics()
+
+    assert code == "333333"
+    assert metrics["otp_fetch_status"] == "success"
+    assert metrics["mailbox_email"] == "tester@example.com"
+    assert metrics["selected_mail_id"] == "12"
+    assert metrics["otp_poll_count"] >= 1

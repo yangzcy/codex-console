@@ -142,7 +142,7 @@ def test_run_registration_task_skips_deferred_task_before_next_retry(monkeypatch
         original_get_db = registration_routes.get_db
         registration_routes.get_db = lambda: manager.session_scope()
         try:
-            outcome = asyncio.get_event_loop().run_until_complete(
+            outcome = asyncio.run(
                 registration_routes.run_registration_task(
                     "task-gated",
                     "freemail",
@@ -165,7 +165,15 @@ def test_task_to_response_includes_retry_state(monkeypatch):
         email_service_id = None
         proxy = None
         logs = None
-        result = None
+        result = {
+            "metadata": {
+                "email_service_selected_domain": "a.example.com",
+                "email_service_runtime_metrics": {
+                    "otp_fetch_status": "timeout",
+                    "otp_poll_count": 3,
+                },
+            }
+        }
         error_message = "等待验证码超时（15 秒）"
         phase = "signup_otp_waiting"
         reason_code = "email_otp_timeout"
@@ -188,6 +196,8 @@ def test_task_to_response_includes_retry_state(monkeypatch):
     assert response.retry_count == 2
     assert response.next_retry_at == "2026-01-01T00:01:00"
     assert response.context_version == 1
+    assert response.email_service_selected_domain == "a.example.com"
+    assert response.email_service_runtime_metrics["otp_fetch_status"] == "timeout"
 
 
 def test_apply_batch_wait_deferred_task_state_keeps_short_retry_window(monkeypatch):
