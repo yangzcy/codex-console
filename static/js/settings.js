@@ -45,6 +45,9 @@ const elements = {
     proxyBatchImportForm: document.getElementById('proxy-batch-import-form'),
     proxyBatchImportText: document.getElementById('proxy-batch-import-text'),
     proxyBatchImportResult: document.getElementById('proxy-batch-import-result'),
+    // 静态代理设置
+    staticProxyForm: document.getElementById('static-proxy-form'),
+    testStaticProxyBtn: document.getElementById('test-static-proxy-btn'),
     // 动态代理设置
     dynamicProxyForm: document.getElementById('dynamic-proxy-form'),
     testDynamicProxyBtn: document.getElementById('test-dynamic-proxy-btn'),
@@ -262,6 +265,14 @@ function initEventListeners() {
         elements.proxyBatchImportForm.addEventListener('submit', handleProxyBatchImport);
     }
 
+    // 静态代理设置
+    if (elements.staticProxyForm) {
+        elements.staticProxyForm.addEventListener('submit', handleSaveStaticProxy);
+    }
+    if (elements.testStaticProxyBtn) {
+        elements.testStaticProxyBtn.addEventListener('click', handleTestStaticProxy);
+    }
+
     // 动态代理设置
     if (elements.dynamicProxyForm) {
         elements.dynamicProxyForm.addEventListener('submit', handleSaveDynamicProxy);
@@ -354,6 +365,24 @@ function initEventListeners() {
 async function loadSettings() {
     try {
         const data = await api.get('/settings');
+
+        // 静态代理设置
+        document.getElementById('static-proxy-enabled').checked = data.proxy?.enabled || false;
+        document.getElementById('static-proxy-type').value = data.proxy?.type || 'http';
+        document.getElementById('static-proxy-host').value = data.proxy?.host || '';
+        document.getElementById('static-proxy-port').value = data.proxy?.port || 7890;
+        document.getElementById('static-proxy-username').value = data.proxy?.username || '';
+        const staticProxyPasswordInput = document.getElementById('static-proxy-password');
+        const staticProxyClearPasswordInput = document.getElementById('static-proxy-clear-password');
+        if (staticProxyPasswordInput) {
+            staticProxyPasswordInput.value = '';
+            staticProxyPasswordInput.placeholder = data.proxy?.has_password
+                ? '已配置，留空保持不变'
+                : '未配置，留空表示不修改';
+        }
+        if (staticProxyClearPasswordInput) {
+            staticProxyClearPasswordInput.checked = false;
+        }
 
         // 动态代理设置
         document.getElementById('dynamic-proxy-enabled').checked = data.proxy?.dynamic_enabled || false;
@@ -1181,6 +1210,59 @@ async function handleSaveOutlookSettings(e) {
 
 // ============== 动态代理设置 ==============
 
+function getStaticProxyPayload() {
+    return {
+        enabled: document.getElementById('static-proxy-enabled').checked,
+        type: document.getElementById('static-proxy-type').value,
+        host: document.getElementById('static-proxy-host').value.trim(),
+        port: parseInt(document.getElementById('static-proxy-port').value, 10) || 0,
+        username: document.getElementById('static-proxy-username').value.trim() || null,
+        password: document.getElementById('static-proxy-password').value || null,
+        clear_password: document.getElementById('static-proxy-clear-password').checked
+    };
+}
+
+async function handleSaveStaticProxy(e) {
+    e.preventDefault();
+
+    const payload = getStaticProxyPayload();
+    try {
+        await api.post('/settings/proxy/static', payload);
+        toast.success('静态代理设置已保存');
+        document.getElementById('static-proxy-password').value = '';
+        document.getElementById('static-proxy-clear-password').checked = false;
+        await loadSettings();
+    } catch (error) {
+        toast.error('保存失败: ' + error.message);
+    }
+}
+
+async function handleTestStaticProxy() {
+    const payload = getStaticProxyPayload();
+    if (!payload.host || !payload.port) {
+        toast.warning('请先填写静态代理地址和端口');
+        return;
+    }
+
+    const btn = elements.testStaticProxyBtn;
+    btn.disabled = true;
+    btn.textContent = '测试中...';
+
+    try {
+        const result = await api.post('/settings/proxy/static/test', payload);
+        if (result.success) {
+            toast.success(result.message);
+        } else {
+            toast.error(result.message);
+        }
+    } catch (error) {
+        toast.error('测试失败: ' + error.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '🔌 测试静态代理';
+    }
+}
+
 async function handleSaveDynamicProxy(e) {
     e.preventDefault();
     const data = {
@@ -1194,6 +1276,7 @@ async function handleSaveDynamicProxy(e) {
         await api.post('/settings/proxy/dynamic', data);
         toast.success('动态代理设置已保存');
         document.getElementById('dynamic-proxy-api-key').value = '';
+        await loadSettings();
     } catch (error) {
         toast.error('保存失败: ' + error.message);
     }

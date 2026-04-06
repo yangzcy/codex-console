@@ -181,6 +181,8 @@ class RegistrationEngine:
         self._last_otp_validation_continue_url_is_gate: bool = False
         self._last_create_account_error_code: str = ""
         self._last_create_account_error_message: str = ""
+        self._last_register_failure_diagnostics: Dict[str, Any] = {}
+        self._last_create_account_failure_diagnostics: Dict[str, Any] = {}
         self._email_creation_error: Optional[str] = None
         self._batch_wait_deferred: bool = False
         self._batch_wait_defer_reason: str = ""
@@ -219,6 +221,8 @@ class RegistrationEngine:
         self._last_otp_validation_continue_url_is_gate = False
         self._last_create_account_error_code = ""
         self._last_create_account_error_message = ""
+        self._last_register_failure_diagnostics = {}
+        self._last_create_account_failure_diagnostics = {}
         self._last_login_password_error_code = ""
         self._last_login_password_error_message = ""
         self._last_login_password_status_code = None
@@ -490,6 +494,43 @@ class RegistrationEngine:
         )
         return True
 
+    def _should_defer_password_pending_login(self) -> bool:
+        return (
+            bool(self.batch_wait_slice_seconds)
+            and bool(str(self.email or "").strip())
+            and bool(str(self.password or "").strip())
+            and str(self._last_login_password_error_code or "").strip().lower() == "invalid_username_or_password"
+        )
+
+    def _mark_password_pending_result(self, result: RegistrationResult, login_error: str) -> bool:
+        if not self._should_defer_password_pending_login():
+            return False
+
+        retry_seconds = max(90, int(self.batch_wait_slice_seconds or 0) * 6)
+        result.email = result.email or str(self.email or "")
+        result.password = self.password or ""
+        result.account_id = result.account_id or str(self._create_account_account_id or "").strip()
+        result.workspace_id = result.workspace_id or str(
+            self._last_validate_otp_workspace_id or self._create_account_workspace_id or ""
+        ).strip()
+        result.refresh_token = result.refresh_token or str(self._create_account_refresh_token or "").strip()
+        result.device_id = result.device_id or str(self.device_id or "")
+        result.source = "login" if self._is_existing_account else "register"
+        if self._is_existing_account:
+            result.reason_code = "token_password_pending"
+            result.error_message = (
+                f"账号已确认进入登录链路，但登录密码暂未生效，先让出并发位 {retry_seconds}s 后再试: "
+                f"{login_error or self._last_login_password_error_message or 'invalid_username_or_password'}"
+            )
+        else:
+            result.reason_code = "token_password_unconfirmed"
+            result.error_message = (
+                f"账号状态尚未确认，登录密码当前被拒绝，先让出并发位 {retry_seconds}s 后再试探测: "
+                f"{login_error or self._last_login_password_error_message or 'invalid_username_or_password'}"
+            )
+        self._log(result.error_message, "warning")
+        return True
+
     def _report_current_email_outcome(self, *, success: bool, error_message: str = "") -> None:
         current_email = str(self.email or self.inbox_email or "").strip()
         if not current_email:
@@ -599,6 +640,7 @@ class RegistrationEngine:
 
     def _merge_email_service_runtime_metadata(self, result: RegistrationResult) -> None:
         metadata = dict(result.metadata or {})
+        metadata["proxy_used"] = str(self.proxy_url or "").strip()
         snapshot = {}
         if isinstance(self.email_info, dict):
             snapshot = dict(self.email_info.get("domain_health_snapshot") or {})
@@ -626,7 +668,81 @@ class RegistrationEngine:
             metadata["email_service_available_domains"] = list(snapshot.get("available_domains") or [])
         if runtime_metrics:
             metadata["email_service_runtime_metrics"] = runtime_metrics
+        if self._last_register_failure_diagnostics:
+            metadata["register_failure_diagnostics"] = dict(self._last_register_failure_diagnostics)
+        if self._last_create_account_failure_diagnostics:
+            metadata["create_account_failure_diagnostics"] = dict(self._last_create_account_failure_diagnostics)
         result.metadata = metadata
+
+    @staticmethod
+    def _sanitize_resume_email_info(email_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(email_info, dict):
+            return {}
+        allowed_keys = {
+            "email",
+            "service_id",
+            "id",
+            "token",
+            "domain",
+            "account_id",
+            "alias",
+            "address",
+            "domain_health_snapshot",
+        }
+        sanitized: Dict[str, Any] = {}
+        for key in allowed_keys:
+            if key in email_info:
+                sanitized[key] = email_info.get(key)
+        return sanitized
+
+    def _attach_resume_context(self, result: RegistrationResult) -> None:
+        metadata = dict(result.metadata or {})
+        metadata["resume_context"] = {
+            "email": str(result.email or self.email or "").strip(),
+            "inbox_email": str(self.inbox_email or "").strip(),
+            "password": str(result.password or self.password or "").strip(),
+            "email_info": self._sanitize_resume_email_info(self.email_info),
+            "is_existing_account": bool(self._is_existing_account),
+            "token_acquisition_requires_login": bool(self._token_acquisition_requires_login),
+            "create_account_account_id": str(self._create_account_account_id or "").strip(),
+            "create_account_workspace_id": str(self._create_account_workspace_id or "").strip(),
+            "create_account_refresh_token": str(self._create_account_refresh_token or "").strip(),
+            "last_validate_otp_workspace_id": str(self._last_validate_otp_workspace_id or "").strip(),
+        }
+        result.metadata = metadata
+
+    def restore_deferred_context(self, payload: Dict[str, Any]) -> bool:
+        if not isinstance(payload, dict):
+            return False
+
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        resume_context = metadata.get("resume_context") if isinstance(metadata.get("resume_context"), dict) else {}
+        if not resume_context:
+            return False
+
+        email = str(resume_context.get("email") or payload.get("email") or "").strip().lower()
+        password = str(resume_context.get("password") or payload.get("password") or "").strip()
+        if not email or not password:
+            return False
+
+        self.email = email
+        self.inbox_email = str(resume_context.get("inbox_email") or email).strip()
+        self.password = password
+        restored_email_info = self._sanitize_resume_email_info(resume_context.get("email_info"))
+        if restored_email_info:
+            restored_email_info["email"] = email
+            self.email_info = restored_email_info
+        self._is_existing_account = bool(resume_context.get("is_existing_account"))
+        self._token_acquisition_requires_login = bool(resume_context.get("token_acquisition_requires_login"))
+        self._create_account_account_id = str(resume_context.get("create_account_account_id") or "").strip() or None
+        self._create_account_workspace_id = str(resume_context.get("create_account_workspace_id") or "").strip() or None
+        self._create_account_refresh_token = str(resume_context.get("create_account_refresh_token") or "").strip() or None
+        self._last_validate_otp_workspace_id = str(resume_context.get("last_validate_otp_workspace_id") or "").strip() or None
+        self._log(
+            f"检测到任务恢复上下文，沿用邮箱 {self.email} 继续登录收尾，不重新创建邮箱",
+            "warning",
+        )
+        return True
 
     def _dump_session_cookies(self) -> str:
         """导出当前会话 cookies（用于后续支付/绑卡自动化）。"""
@@ -790,6 +906,107 @@ class RegistrationEngine:
             pass
         return ""
 
+    @staticmethod
+    def _summarize_cookie_text(cookie_text: str) -> Dict[str, Any]:
+        """
+        脱敏汇总 Cookie 文本，只保留键名和长度，避免把完整 token 打进日志。
+        """
+        summary: Dict[str, Any] = {
+            "cookie_count": 0,
+            "keys": [],
+            "interesting": {},
+        }
+        text = str(cookie_text or "").strip()
+        if not text:
+            return summary
+
+        pairs: list[tuple[str, str]] = []
+        for chunk in text.split(";"):
+            item = str(chunk or "").strip()
+            if not item or "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            key = str(key or "").strip()
+            value = str(value or "").strip()
+            if not key:
+                continue
+            pairs.append((key, value))
+
+        keys = [key for key, _ in pairs]
+        summary["cookie_count"] = len(keys)
+        summary["keys"] = keys
+
+        interesting_prefixes = (
+            "oai-",
+            "__Secure-next-auth.session-token",
+            "_Secure-next-auth.session-token",
+            "__cf",
+            "cf_",
+        )
+        interesting: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key.startswith(interesting_prefixes):
+                interesting[key] = {
+                    "present": True,
+                    "len": len(value),
+                }
+        summary["interesting"] = interesting
+        return summary
+
+    def _collect_register_failure_diagnostics(self, response) -> Dict[str, Any]:
+        """
+        收集建号口失败时的最小必要诊断信息。
+        """
+        request_cookie_text = self._extract_request_cookie_header(response)
+        session_cookie_text = self._dump_session_cookies()
+
+        request_headers: Dict[str, Any] = {}
+        try:
+            req_headers = getattr(getattr(response, "request", None), "headers", None)
+            if req_headers is not None:
+                request_headers = {
+                    "origin": str(req_headers.get("origin") or ""),
+                    "referer": str(req_headers.get("referer") or ""),
+                    "accept": str(req_headers.get("accept") or ""),
+                    "content-type": str(req_headers.get("content-type") or ""),
+                    "x-requested-with": str(req_headers.get("x-requested-with") or ""),
+                    "openai-sentinel-token": "present" if req_headers.get("openai-sentinel-token") else "",
+                }
+        except Exception:
+            request_headers = {}
+
+        response_headers: Dict[str, Any] = {}
+        try:
+            headers = getattr(response, "headers", None)
+            if headers is not None:
+                for key in (
+                    "cf-ray",
+                    "x-request-id",
+                    "x-openai-public-ip",
+                    "openai-processing-ms",
+                    "set-cookie",
+                    "content-type",
+                ):
+                    value = headers.get(key) if hasattr(headers, "get") else None
+                    if value:
+                        response_headers[key] = str(value)
+        except Exception:
+            response_headers = {}
+
+        return {
+            "status_code": int(getattr(response, "status_code", 0) or 0),
+            "url": str(getattr(response, "url", "") or ""),
+            "proxy_url": str(self.proxy_url or ""),
+            "email": str(self.email or ""),
+            "email_domain": self._get_current_email_domain(),
+            "device_id": str(self.device_id or self.session.cookies.get("oai-did") or "").strip() if self.session else "",
+            "request_headers": request_headers,
+            "request_cookie_summary": self._summarize_cookie_text(request_cookie_text),
+            "session_cookie_summary": self._summarize_cookie_text(session_cookie_text),
+            "response_headers": response_headers,
+            "set_cookie_flattened": self._flatten_set_cookie_headers(response)[:800],
+        }
+
     def _generate_password(self, length: int = DEFAULT_PASSWORD_LENGTH) -> str:
         """生成随机密码"""
         return ''.join(secrets.choice(PASSWORD_CHARSET) for _ in range(length))
@@ -872,9 +1089,86 @@ class RegistrationEngine:
 
                 response = self.session.get(
                     self.oauth_start.auth_url,
-                    timeout=20
+                    timeout=20,
+                    allow_redirects=True,
                 )
                 did = self.session.cookies.get("oai-did")
+
+                try:
+                    history_urls = [
+                        str(getattr(item, "url", "") or "")
+                        for item in list(getattr(response, "history", []) or [])
+                        if str(getattr(item, "url", "") or "")
+                    ]
+                except Exception:
+                    history_urls = []
+                try:
+                    auth_cookie_current = str(self.session.cookies.get("oai-client-auth-session") or "").strip()
+                except Exception:
+                    auth_cookie_current = ""
+                try:
+                    import base64
+                    import urllib.parse as _urlparse
+
+                    final_url = str(getattr(response, "url", "") or "")
+                    parsed_final = _urlparse.urlparse(final_url)
+                    final_query = _urlparse.parse_qs(parsed_final.query or "", keep_blank_values=True)
+                    payload_raw = str((final_query.get("payload") or [""])[0] or "").strip()
+                    payload_decoded = ""
+                    payload_json = None
+                    if payload_raw:
+                        try:
+                            padded = payload_raw + ("=" * (-len(payload_raw) % 4))
+                            payload_decoded = base64.b64decode(_urlparse.unquote(padded)).decode("utf-8", errors="replace")
+                            payload_json = json.loads(payload_decoded)
+                        except Exception:
+                            payload_decoded = ""
+                            payload_json = None
+
+                    auth_url_query = {}
+                    if self.oauth_start and getattr(self.oauth_start, "auth_url", None):
+                        try:
+                            parsed_auth = _urlparse.urlparse(str(self.oauth_start.auth_url))
+                            auth_url_query_raw = _urlparse.parse_qs(parsed_auth.query or "", keep_blank_values=True)
+                            for key in (
+                                "client_id",
+                                "redirect_uri",
+                                "scope",
+                                "response_type",
+                                "code_challenge_method",
+                                "screen_hint",
+                                "prompt",
+                                "codex_cli_simplified_flow",
+                                "id_token_add_organizations",
+                            ):
+                                value = (auth_url_query_raw.get(key) or [""])[0]
+                                if value != "":
+                                    auth_url_query[key] = value
+                        except Exception:
+                            auth_url_query = {}
+
+                    self._log(
+                        "OAuth 起始页结果: " + json.dumps({
+                            "status_code": int(getattr(response, "status_code", 0) or 0),
+                            "final_url": final_url,
+                            "final_path": str(parsed_final.path or ""),
+                            "history_count": len(history_urls),
+                            "history_tail": history_urls[-4:],
+                            "final_query_keys": sorted(final_query.keys()),
+                            "final_query_error_code": str((final_query.get("error") or [""])[0] or ""),
+                            "final_query_session_id": str((final_query.get("session_id") or [""])[0] or ""),
+                            "final_query_verifier_id": str((final_query.get("verifier_id") or [""])[0] or ""),
+                            "payload_json": payload_json,
+                            "payload_preview": (payload_decoded[:400] if payload_decoded else ""),
+                            "oauth_authorize_query": auth_url_query,
+                            "set_cookie_summary": self._summarize_cookie_text(self._flatten_set_cookie_headers(response)),
+                            "jar_cookie_summary": self._summarize_cookie_text(self._dump_session_cookies()),
+                            "jar_oai_client_auth_session_len": len(auth_cookie_current),
+                            "jar_oai_did": str(did or "").strip(),
+                        }, ensure_ascii=False),
+                    )
+                except Exception as oauth_diag_error:
+                    self._log(f"OAuth 起始页诊断收集异常: {oauth_diag_error}", "warning")
 
                 if not did:
                     # 对齐 ABCard：部分环境 cookie 不落盘，尝试从 HTML 文本提取
@@ -960,6 +1254,24 @@ class RegistrationEngine:
         current_sen_token = str(sen_token or "").strip() if sen_token else None
         for attempt in range(1, max_attempts + 1):
             try:
+                # 起始页落下的 auth session 常带有 username=guest；
+                # 进入具体入口页后服务端才会把 screen_hint / 路径上下文绑定到会话。
+                try:
+                    self.session.get(
+                        referer,
+                        headers={
+                            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "referer": "https://auth.openai.com/",
+                            "user-agent": (
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                            ),
+                        },
+                        timeout=20,
+                    )
+                except Exception as warmup_error:
+                    self._log(f"{log_label}入口页预热异常: {warmup_error}", "warning")
+
                 request_body = json.dumps({
                     "username": {
                         "value": self.email,
@@ -969,9 +1281,11 @@ class RegistrationEngine:
                 })
 
                 headers = {
+                    "origin": "https://auth.openai.com",
                     "referer": referer,
                     "accept": "application/json",
                     "content-type": "application/json",
+                    "x-requested-with": "XMLHttpRequest",
                 }
 
                 if current_sen_token:
@@ -983,6 +1297,30 @@ class RegistrationEngine:
                         "flow": "authorize_continue",
                     })
                     headers["openai-sentinel-token"] = sentinel
+
+                cookie_header = self._dump_session_cookies()
+                if cookie_header:
+                    headers["cookie"] = cookie_header
+
+                try:
+                    auth_cookie_current = str(self.session.cookies.get("oai-client-auth-session") or "").strip() if self.session else ""
+                except Exception:
+                    auth_cookie_current = ""
+                try:
+                    did_cookie_current = str(self.session.cookies.get("oai-did") or "").strip() if self.session else ""
+                except Exception:
+                    did_cookie_current = ""
+                try:
+                    self._log(
+                        f"{log_label}请求前 Cookie 快照: " + json.dumps({
+                            "cookie_header_summary": self._summarize_cookie_text(cookie_header),
+                            "jar_oai_client_auth_session_len": len(auth_cookie_current),
+                            "jar_oai_did": did_cookie_current,
+                        }, ensure_ascii=False),
+                        "warning",
+                    )
+                except Exception as cookie_diag_error:
+                    self._log(f"{log_label}请求前 Cookie 快照收集异常: {cookie_diag_error}", "warning")
 
                 response = self.session.post(
                     OPENAI_API_ENDPOINTS["signup"],
@@ -1033,6 +1371,14 @@ class RegistrationEngine:
 
                 if self._is_invalid_auth_step(response.status_code, response.text) and attempt < max_attempts:
                     wait_seconds = min(10, 3 * attempt)
+                    try:
+                        diagnostics = self._collect_register_failure_diagnostics(response)
+                        self._log(
+                            f"{log_label} invalid_auth_step 诊断: " + json.dumps(diagnostics, ensure_ascii=False),
+                            "warning",
+                        )
+                    except Exception as diagnostics_error:
+                        self._log(f"{log_label} invalid_auth_step 诊断收集异常: {diagnostics_error}", "warning")
                     self._log(
                         f"{log_label}命中 invalid_auth_step（第 {attempt}/{max_attempts} 次），"
                         f"授权步骤可能错位，重建 OAuth 上下文后 {wait_seconds}s 再试...",
@@ -1078,6 +1424,14 @@ class RegistrationEngine:
                     continue
 
                 if response.status_code != 200:
+                    try:
+                        diagnostics = self._collect_register_failure_diagnostics(response)
+                        self._log(
+                            f"{log_label}失败诊断: " + json.dumps(diagnostics, ensure_ascii=False),
+                            "warning",
+                        )
+                    except Exception as diagnostics_error:
+                        self._log(f"{log_label}失败诊断收集异常: {diagnostics_error}", "warning")
                     return SignupFormResult(
                         success=False,
                         error_message=f"HTTP {response.status_code}: {response.text[:200]}"
@@ -1182,13 +1536,21 @@ class RegistrationEngine:
             try:
                 if not self._wait_for_login_password_submission_slot():
                     return SignupFormResult(success=False, error_message="任务已取消")
+
+                # 手动添加 Cookie 头（curl_cffi 不会自动添加）
+                headers = {
+                    "origin": "https://auth.openai.com",
+                    "referer": "https://auth.openai.com/log-in/password",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                }
+                cookie_header = self._dump_session_cookies()
+                if cookie_header:
+                    headers["cookie"] = cookie_header
+
                 response = self.session.post(
                     OPENAI_API_ENDPOINTS["password_verify"],
-                    headers={
-                        "referer": "https://auth.openai.com/log-in/password",
-                        "accept": "application/json",
-                        "content-type": "application/json",
-                    },
+                    headers=headers,
                     data=json.dumps({"password": self.password}),
                 )
 
@@ -2756,6 +3118,7 @@ class RegistrationEngine:
         """注册密码"""
         try:
             self._last_register_password_error = None
+            self._last_register_failure_diagnostics = {}
             # 生成密码
             password = self._generate_password()
             self.password = password  # 保存密码到实例变量
@@ -2768,18 +3131,56 @@ class RegistrationEngine:
             })
 
             max_attempts = 2
+            current_did = str(did or self.device_id or "").strip()
+            current_sen_token = str(sen_token or "").strip() if sen_token else None
             for attempt in range(1, max_attempts + 1):
                 if not self._wait_for_register_submission_slot():
                     self._last_register_password_error = "任务已取消"
                     return False, None
 
+                try:
+                    self.session.get(
+                        "https://auth.openai.com/create-account/password",
+                        headers={
+                            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "referer": "https://auth.openai.com/create-account",
+                            "user-agent": (
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                            ),
+                        },
+                        timeout=20,
+                    )
+                except Exception as warmup_error:
+                    self._log(f"密码页预热异常: {warmup_error}", "warning")
+
+                # 手动添加 Cookie 头（curl_cffi 不会自动添加）
+                headers = {
+                    "origin": "https://auth.openai.com",
+                    "referer": "https://auth.openai.com/create-account/password",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "x-requested-with": "XMLHttpRequest",
+                }
+                if current_sen_token and current_did:
+                    headers["openai-sentinel-token"] = json.dumps({
+                        "p": "",
+                        "t": "",
+                        "c": current_sen_token,
+                        "id": current_did,
+                        "flow": "create_account_password",
+                    })
+                cookie_header = self._dump_session_cookies()
+                self._log(f"[DEBUG] _dump_session_cookies 返回长度: {len(cookie_header)}, 前100字符: {cookie_header[:100]}")
+                if cookie_header:
+                    headers["cookie"] = cookie_header
+                    self._log(f"[DEBUG] 已添加 Cookie 头到 headers")
+                else:
+                    self._log(f"[DEBUG] cookie_header 为空，未添加到 headers", "warning")
+
                 response = self.session.post(
                     OPENAI_API_ENDPOINTS["register"],
-                    headers={
-                        "referer": "https://auth.openai.com/create-account/password",
-                        "accept": "application/json",
-                        "content-type": "application/json",
-                    },
+                    headers=headers,
                     data=register_body,
                 )
 
@@ -2790,6 +3191,16 @@ class RegistrationEngine:
 
                 error_text = response.text[:500]
                 self._log(f"密码注册失败: {error_text}", "warning")
+                try:
+                    diagnostics = self._collect_register_failure_diagnostics(response)
+                    self._last_register_failure_diagnostics = dict(diagnostics or {})
+                    self._log(
+                        "密码注册失败诊断: " + json.dumps(diagnostics, ensure_ascii=False),
+                        "warning",
+                    )
+                except Exception as diagnostics_error:
+                    self._last_register_failure_diagnostics = {}
+                    self._log(f"密码注册失败诊断收集异常: {diagnostics_error}", "warning")
 
                 normalized_error_msg = ""
                 normalized_error_code = ""
@@ -2817,10 +3228,48 @@ class RegistrationEngine:
                         f"{wait_seconds}s 后自动退避重试一次...",
                         "warning",
                     )
+                    try:
+                        refreshed = self._check_sentinel(current_did) if current_did else None
+                        if refreshed:
+                            current_sen_token = refreshed
+                    except Exception:
+                        pass
+                    try:
+                        if self.oauth_start and getattr(self.oauth_start, "auth_url", None):
+                            self.session.get(str(self.oauth_start.auth_url), timeout=12)
+                    except Exception:
+                        pass
                     if not self._sleep_interruptible(wait_seconds):
                         self._last_register_password_error = "任务已取消"
                         return False, None
                     continue
+
+                if did and normalized_error_msg.lower() == "failed to create account. please try again.":
+                    self._log("建号口返回通用拒绝，尝试登录入口探测当前邮箱状态...", "warning")
+                    try:
+                        probe = self._submit_login_start(did, sen_token)
+                        probe_diag = {
+                            "success": bool(probe.success),
+                            "page_type": str(probe.page_type or ""),
+                            "is_existing_account": bool(probe.is_existing_account),
+                            "error_message": str(probe.error_message or ""),
+                        }
+                        self._log(
+                            "密码注册失败后登录探测: " + json.dumps(probe_diag, ensure_ascii=False),
+                            "warning",
+                        )
+                        if probe.success and probe.page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
+                            self._log("登录入口探测命中邮箱 OTP 页：该邮箱大概率已经建成或已存在", "warning")
+                            self._is_existing_account = True
+                            self._token_acquisition_requires_login = True
+                            return True, password
+                        if probe.success and probe.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
+                            self._log(
+                                "登录入口仅返回密码页：只能说明邮箱可进入登录流程，不能证明刚才注册已成功",
+                                "warning",
+                            )
+                    except Exception as probe_error:
+                        self._log(f"密码注册失败后登录探测异常: {probe_error}", "warning")
 
                 # 解析错误信息，判断是否是邮箱已注册
                 try:
@@ -2838,16 +3287,18 @@ class RegistrationEngine:
                             self._log("检测到用户名注册失败，尝试登录入口探测邮箱是否已存在...", "warning")
                             try:
                                 probe = self._submit_login_start(did, sen_token)
-                                if probe.success and probe.page_type in (
-                                    OPENAI_PAGE_TYPES["LOGIN_PASSWORD"],
-                                    OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"],
-                                ):
-                                    self._log("登录入口探测命中：该邮箱大概率已是 OpenAI 账号", "warning")
+                                if probe.success and probe.page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
+                                    self._log("登录入口探测命中邮箱 OTP 页：该邮箱大概率已是 OpenAI 账号", "warning")
                                     self._mark_email_as_registered()
                                     self._last_register_password_error = (
                                         "该邮箱已存在 OpenAI 账号。"
                                         "若是刚刚注册中断，请优先使用上一轮任务日志里的“生成密码”走登录续跑；"
                                         "拿不到旧密码再更换邮箱。"
+                                    )
+                                elif probe.success and probe.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
+                                    self._log(
+                                        "登录入口仅返回密码页：不能据此判定该邮箱已是 OpenAI 账号",
+                                        "warning",
                                     )
                             except Exception as probe_error:
                                 self._log(f"登录入口探测失败: {probe_error}", "warning")
@@ -2976,13 +3427,19 @@ class RegistrationEngine:
             self._last_otp_validation_continue_url_is_gate = False
             code_body = f'{{"code":"{code}"}}'
 
+            # 手动添加 Cookie 头（curl_cffi 不会自动添加）
+            headers = {
+                "referer": "https://auth.openai.com/email-verification",
+                "accept": "application/json",
+                "content-type": "application/json",
+            }
+            cookie_header = self._dump_session_cookies()
+            if cookie_header:
+                headers["cookie"] = cookie_header
+
             response = self.session.post(
                 OPENAI_API_ENDPOINTS["validate_otp"],
-                headers={
-                    "referer": "https://auth.openai.com/email-verification",
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                },
+                headers=headers,
                 data=code_body,
             )
 
@@ -3223,17 +3680,24 @@ class RegistrationEngine:
         try:
             self._last_create_account_error_code = ""
             self._last_create_account_error_message = ""
+            self._last_create_account_failure_diagnostics = {}
             user_info = generate_random_user_info()
             self._log(f"生成用户信息: {user_info['name']}, 生日: {user_info['birthdate']}")
             create_account_body = json.dumps(user_info)
 
+            # 手动添加 Cookie 头（curl_cffi 不会自动添加）
+            headers = {
+                "referer": "https://auth.openai.com/about-you",
+                "accept": "application/json",
+                "content-type": "application/json",
+            }
+            cookie_header = self._dump_session_cookies()
+            if cookie_header:
+                headers["cookie"] = cookie_header
+
             response = self.session.post(
                 OPENAI_API_ENDPOINTS["create_account"],
-                headers={
-                    "referer": "https://auth.openai.com/about-you",
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                },
+                headers=headers,
                 data=create_account_body,
             )
 
@@ -3242,6 +3706,15 @@ class RegistrationEngine:
             if response.status_code != 200:
                 body_preview = str(response.text or "")[:200]
                 self._log(f"账户创建失败: {body_preview}", "warning")
+                try:
+                    self._last_create_account_failure_diagnostics = self._collect_register_failure_diagnostics(response)
+                    self._log(
+                        "账户创建失败诊断: " + json.dumps(self._last_create_account_failure_diagnostics, ensure_ascii=False),
+                        "warning",
+                    )
+                except Exception as diagnostics_error:
+                    self._last_create_account_failure_diagnostics = {}
+                    self._log(f"账户创建失败诊断收集异常: {diagnostics_error}", "warning")
                 try:
                     payload = response.json() or {}
                     error_payload = payload.get("error") if isinstance(payload, dict) else {}
@@ -3405,13 +3878,19 @@ class RegistrationEngine:
         try:
             select_body = f'{{"workspace_id":"{workspace_id}"}}'
 
+            # 手动添加 Cookie 头（curl_cffi 不会自动添加）
+            headers = {
+                "referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                "content-type": "application/json",
+                "accept": "application/json",
+            }
+            cookie_header = self._dump_session_cookies()
+            if cookie_header:
+                headers["cookie"] = cookie_header
+
             response = self.session.post(
                 OPENAI_API_ENDPOINTS["select_workspace"],
-                headers={
-                    "referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
-                    "content-type": "application/json",
-                    "accept": "application/json",
-                },
+                headers=headers,
                 data=select_body,
                 allow_redirects=False,
             )
@@ -3612,6 +4091,25 @@ class RegistrationEngine:
                 return result
 
             self._log(f"IP 位置: {location}")
+            resume_login_only = (
+                bool(str(self.email or "").strip())
+                and bool(str(self.password or "").strip())
+                and self._is_existing_account
+                and self._token_acquisition_requires_login
+            )
+            if resume_login_only:
+                result.email = self.email or ""
+                result.password = self.password or ""
+                result.device_id = self.device_id or ""
+                self._set_result_phase(result, "token_relogin_resume")
+                self._log("检测到延迟恢复现场，跳过建号链路，直接继续登录收尾...")
+                login_ready, login_error = self._restart_login_flow()
+                if not login_ready:
+                    if self._mark_password_pending_result(result, login_error):
+                        return result
+                    result.error_message = login_error
+                    return result
+
             for identity_attempt in range(1, max_fresh_email_attempts + 1):
                 outcome_reported = False
                 retry_notice = None
@@ -3689,6 +4187,19 @@ class RegistrationEngine:
                     if should_retry_with_fresh_email:
                         continue
 
+                    if self._is_existing_account:
+                        self._log("建号口虽返回通用拒绝，但登录探测表明账号已可登录，切换到登录收尾链路", "warning")
+                        login_ready, login_error = self._restart_login_flow()
+                        if not login_ready:
+                            if self._mark_password_pending_result(result, login_error):
+                                return result
+                            if self._is_rate_limit_error(login_error) and self._defer_token_acquisition_rate_limit(result, login_error):
+                                if self._apply_batch_wait_deferred_result(result):
+                                    return result
+                            result.error_message = login_error
+                            return result
+                        break
+
                     self._log("6. 催一下注册验证码出门，邮差该冲刺了...")
                     if not self._send_verification_code():
                         result.error_message = "发送验证码失败"
@@ -3723,6 +4234,8 @@ class RegistrationEngine:
                     if effective_entry_flow in {"native", "outlook"}:
                         login_ready, login_error = self._restart_login_flow()
                         if not login_ready:
+                            if self._mark_password_pending_result(result, login_error):
+                                return result
                             if self._is_rate_limit_error(login_error) and self._defer_token_acquisition_rate_limit(result, login_error):
                                 if self._apply_batch_wait_deferred_result(result):
                                     return result
@@ -3800,6 +4313,7 @@ class RegistrationEngine:
         finally:
             self._finalize_result_failure_reason(result)
             self._merge_email_service_runtime_metadata(result)
+            self._attach_resume_context(result)
             if not outcome_reported and self.email and (result.success or result.error_message):
                 self._report_current_email_outcome(
                     success=bool(result.success),

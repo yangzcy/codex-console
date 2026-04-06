@@ -5,6 +5,7 @@ import asyncio
 
 from src.core.register import RegistrationResult
 from src.core.mailbox_registry import MailboxRegistry
+from src.core import dynamic_proxy
 from src.database import crud
 from src.database.session import DatabaseSessionManager
 from src.web.routes import registration as registration_routes
@@ -16,6 +17,10 @@ def _patch_registry_path(monkeypatch, path: Path) -> None:
         "_registry_path",
         classmethod(lambda cls: path),
     )
+
+
+def _patch_proxy_health_path(monkeypatch, path: Path) -> None:
+    monkeypatch.setattr(dynamic_proxy, "_health_store_path", lambda: path)
 
 
 def test_apply_retry_policy_marks_task_deferred(monkeypatch):
@@ -246,6 +251,85 @@ def test_finalize_cancelled_task_preserves_existing_reason(monkeypatch):
             session.close()
 
 
+def test_get_proxy_for_registration_skips_cooling_default_proxy(monkeypatch):
+    with TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "route_proxy_skip.db"
+        proxy_health_path = Path(tmpdir) / "dynamic_proxy_health.json"
+        _patch_proxy_health_path(monkeypatch, proxy_health_path)
+        manager = DatabaseSessionManager(f"sqlite:///{db_path}")
+        manager.create_tables()
+        manager.migrate_tables()
+
+        session = manager.SessionLocal()
+        try:
+            default_proxy = crud.create_proxy(
+                session,
+                name="default",
+                type="http",
+                host="172.19.0.1",
+                port=41085,
+                enabled=True,
+            )
+            default_proxy = crud.set_proxy_default(session, default_proxy.id)
+            fallback_proxy = crud.create_proxy(
+                session,
+                name="fallback",
+                type="http",
+                host="172.19.0.1",
+                port=41081,
+                enabled=True,
+            )
+
+            dynamic_proxy.report_dynamic_proxy_result(
+                report_url="",
+                proxy_url=default_proxy.proxy_url,
+                task_id="task-1",
+                success=False,
+                reason="register_create_account_retryable",
+                detail="Failed to create account. Please try again.",
+            )
+
+            proxy_url, proxy_id = registration_routes.get_proxy_for_registration(session)
+
+            assert proxy_url == fallback_proxy.proxy_url
+            assert proxy_id == fallback_proxy.id
+        finally:
+            session.close()
+
+
+def test_report_dynamic_proxy_result_skips_mailbox_creation_failures(monkeypatch):
+    reported = []
+
+    monkeypatch.setattr(
+        registration_routes,
+        "get_settings",
+        lambda: type(
+            "_Settings",
+            (),
+            {
+                "proxy_dynamic_report_url": "",
+                "proxy_dynamic_api_key": None,
+                "proxy_dynamic_api_key_header": "X-API-Key",
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        "src.core.dynamic_proxy.report_dynamic_proxy_result",
+        lambda **kwargs: reported.append(kwargs),
+    )
+
+    registration_routes._report_dynamic_proxy_result_if_needed(
+        dynamic_proxy_used=False,
+        proxy_url="http://172.19.0.1:41085",
+        task_uuid="task-mailbox-fail",
+        outcome="deferred",
+        phase="init",
+        error_message="创建邮箱失败: 当前无可用邮箱域名",
+    )
+
+    assert reported == []
+
+
 def test_cancel_task_endpoint_reason_is_not_overwritten_by_followup_finalize(monkeypatch):
     status_updates = []
     monkeypatch.setattr(
@@ -329,6 +413,7 @@ def test_task_to_response_includes_retry_state(monkeypatch):
 
     assert response.phase == "signup_otp_waiting"
     assert response.reason_code == "email_otp_timeout"
+    assert response.reason_text == "邮箱验证码超时"
     assert response.defer_bucket == "deferred_short"
     assert response.retry_count == 2
     assert response.next_retry_at == "2026-01-01T00:01:00"

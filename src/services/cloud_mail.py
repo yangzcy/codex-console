@@ -328,14 +328,7 @@ class CloudMailService(BaseEmailService):
 
     @staticmethod
     def _bootstrap_domain_order(configured_domains: List[str], ordered_domains: List[str]) -> List[str]:
-        if not ordered_domains:
-            return []
-        configured_index = {domain: idx for idx, domain in enumerate(configured_domains)}
-        return sorted(
-            ordered_domains,
-            key=lambda domain: configured_index.get(domain, -1),
-            reverse=True,
-        )
+        return list(ordered_domains or [])
 
     def _select_domain(self, requested_domain: Any = None) -> str:
         configured_domains = self._normalize_domain_list(
@@ -409,12 +402,20 @@ class CloudMailService(BaseEmailService):
                 ]
                 probe_slots = max(0, int(self.config.get("exploratory_probe_slots") or 0))
                 if available_exploratory:
-                    return proven_domains + available_exploratory[:probe_slots]
+                    if probe_slots <= 0:
+                        return proven_domains
+                    rotation_key = f"{base_url}::{','.join(available_exploratory)}"
+                    next_offset = CloudMailService._domain_rotation_offsets.get(rotation_key, 0)
+                    rotated = available_exploratory[next_offset:] + available_exploratory[:next_offset]
+                    CloudMailService._domain_rotation_offsets[rotation_key] = (
+                        (next_offset + 1) % len(available_exploratory)
+                    )
+                    return proven_domains + rotated[:probe_slots]
                 return proven_domains
 
             # 冷启动阶段：健康池被清空后，先只放一个引导域名做 canary。
-            # 这里优先取配置里的最后一个域名，且在出现 proven 域名前不放行其他新域名，
-            # 避免首批并发把 maia/maib/maic 之类探索域名先打出失败。
+            # 这里固定取健康排序后的首选域名，在出现 proven 域名前不放行其他新域名，
+            # 避免首批并发把多个探索域名同时打坏；同时不要对“配置里的最后一个域名”产生偏置。
             bootstrap_order = self._bootstrap_domain_order(configured_domains, ordered)
             bootstrap_domain = bootstrap_order[0] if bootstrap_order else ordered[0]
             return [bootstrap_domain]

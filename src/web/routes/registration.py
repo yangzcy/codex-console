@@ -6,6 +6,8 @@ import asyncio
 import logging
 import uuid
 import random
+import time
+import threading
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Tuple
 
@@ -36,11 +38,33 @@ router = APIRouter()
 BATCH_OTP_WAIT_SLICE_SECONDS = 15
 BATCH_OTP_WAIT_RETRY_DELAY_SECONDS = 20
 BATCH_OTP_WAIT_MAX_DEFERS = 6
+REGISTRATION_STATS_CACHE_TTL_SECONDS = 5
 
 # 任务存储（简单的内存存储，生产环境应使用 Redis）
 running_tasks: dict = {}
 # 批量任务存储
 batch_tasks: Dict[str, dict] = {}
+_registration_stats_cache: Dict[str, object] = {
+    "expires_at": 0.0,
+    "payload": None,
+}
+_registration_stats_cache_lock = threading.Lock()
+
+
+def _get_cached_registration_stats() -> Optional[dict]:
+    now = time.monotonic()
+    with _registration_stats_cache_lock:
+        if _registration_stats_cache["expires_at"] > now:
+            payload = _registration_stats_cache["payload"]
+            if isinstance(payload, dict):
+                return dict(payload)
+    return None
+
+
+def _set_cached_registration_stats(payload: dict) -> None:
+    with _registration_stats_cache_lock:
+        _registration_stats_cache["payload"] = dict(payload)
+        _registration_stats_cache["expires_at"] = time.monotonic() + REGISTRATION_STATS_CACHE_TTL_SECONDS
 
 
 def _model_dump(data) -> dict:
@@ -220,13 +244,25 @@ def get_proxy_for_registration(db) -> Tuple[Optional[str], Optional[int]]:
     Returns:
         Tuple[proxy_url, proxy_id]: 代理 URL 和代理 ID（如果来自代理列表）
     """
-    # 先尝试从代理列表中获取
-    proxy = crud.get_random_proxy(db)
-    if proxy:
-        return proxy.proxy_url, proxy.id
+    from ...core.dynamic_proxy import get_proxy_url_for_task, is_proxy_cooling
+    from ...database.models import Proxy as ProxyModel
+    from sqlalchemy import asc, desc
+
+    # 先尝试从代理列表中获取，跳过本地冷却中的出口。
+    configured_proxies = (
+        db.query(ProxyModel)
+        .filter(ProxyModel.enabled == True)
+        .order_by(desc(ProxyModel.is_default), asc(ProxyModel.id))
+        .all()
+    )
+    for proxy in configured_proxies:
+        proxy_url = proxy.proxy_url
+        if is_proxy_cooling(proxy_url):
+            logger.warning("注册代理决策: 跳过冷却中的代理列表出口: %s", proxy_url)
+            continue
+        return proxy_url, proxy.id
 
     # 代理列表为空，尝试动态代理或静态代理
-    from ...core.dynamic_proxy import get_proxy_url_for_task
     proxy_url = get_proxy_url_for_task()
     if proxy_url:
         return proxy_url, None
@@ -315,6 +351,7 @@ class RegistrationTaskResponse(BaseModel):
     error_message: Optional[str] = None
     phase: Optional[str] = None
     reason_code: Optional[str] = None
+    reason_text: Optional[str] = None
     defer_bucket: Optional[str] = None
     retry_count: Optional[int] = None
     next_retry_at: Optional[str] = None
@@ -389,6 +426,25 @@ class OutlookBatchRegistrationResponse(BaseModel):
 
 # ============== Helper Functions ==============
 
+REASON_CODE_TEXTS = {
+    "email_otp_timeout": "邮箱验证码超时",
+    "oauth_callback_miss": "OAuth 回调未命中",
+    "token_password_pending": "账号已确认进入登录链路，密码暂未生效",
+    "token_password_unconfirmed": "账号状态未确认，登录密码当前被拒绝",
+    "primaryapi_server_error": "上游服务异常",
+    "registration_disallowed": "当前邮箱域名被注册策略拒绝",
+    "network_timeout": "网络超时",
+    "proxy_pool_exhausted": "代理池耗尽",
+    "unknown_retryable": "可重试异常",
+}
+
+
+def _get_reason_text(reason_code: Optional[str]) -> Optional[str]:
+    key = str(reason_code or "").strip()
+    if not key:
+        return None
+    return REASON_CODE_TEXTS.get(key, key)
+
 def task_to_response(task: RegistrationTask, db=None) -> RegistrationTaskResponse:
     """转换任务模型为响应"""
     email_service, email_service_name = _resolve_task_email_service(task, db=db)
@@ -414,6 +470,7 @@ def task_to_response(task: RegistrationTask, db=None) -> RegistrationTaskRespons
         error_message=task.error_message,
         phase=getattr(task, "phase", None),
         reason_code=getattr(task, "reason_code", None),
+        reason_text=_get_reason_text(getattr(task, "reason_code", None)),
         defer_bucket=getattr(task, "defer_bucket", None),
         retry_count=getattr(task, "retry_count", None),
         next_retry_at=task.next_retry_at.isoformat() if getattr(task, "next_retry_at", None) else None,
@@ -647,6 +704,12 @@ def _apply_retry_policy_for_failed_task(
             retry_count=retry_count + 1,
             phase=phase,
         )
+        crud.update_registration_task(
+            db,
+            task_uuid,
+            result=result.to_dict(),
+            error_message=result.error_message,
+        )
         task_manager.update_status(task_uuid, "failed", error=result.error_message)
         logger.warning(f"注册任务失败: {task_uuid}, 原因: {result.error_message}")
         return _make_task_execution_outcome("failed", error=result.error_message)
@@ -676,6 +739,7 @@ def _apply_retry_policy_for_failed_task(
         crud.update_registration_task(
             db,
             task_uuid,
+            result=result.to_dict(),
             error_message=result.error_message,
         )
         task_manager.update_status(
@@ -721,6 +785,7 @@ def _resolve_batch_wait_reason_code(reason: str, defer_code: str) -> str:
         "otp_wait_timeout": "email_otp_timeout",
         "token_acquisition_rate_limited": "unknown_retryable",
         "token_acquisition_dirty_window": "oauth_callback_miss",
+        "token_acquisition_password_pending": "token_password_pending",
         "exploratory_domain_register_retryable": "unknown_retryable",
     }
     if code in mapped_codes:
@@ -776,17 +841,18 @@ def _apply_batch_wait_deferred_task_state(
         task_uuid,
         status="deferred",
         reason_code=reason_code,
-        defer_bucket=defer_bucket,
-        retry_count=retry_count + 1,
-        next_retry_at=next_retry_at,
-        phase=resume_phase,
-        context_version=int(getattr(task, "context_version", 0) or 0),
-    )
+            defer_bucket=defer_bucket,
+            retry_count=retry_count + 1,
+            next_retry_at=next_retry_at,
+            phase=resume_phase,
+            context_version=int(getattr(task, "context_version", 0) or 0),
+        )
     crud.update_registration_task(
         db,
         task_uuid,
         started_at=None,
         completed_at=None,
+        result=batch_wait_result.to_dict(),
         error_message=reason,
     )
     task_manager.update_status(
@@ -812,6 +878,8 @@ def _classify_proxy_report_reason(error_text: str, outcome: str) -> str:
     outcome_key = str(outcome or "").strip().lower()
     if outcome_key == "completed":
         return "success"
+    if "failed to create account. please try again." in text:
+        return "register_create_account_retryable"
     if "http 429" in text or "rate limit exceeded" in text or "too many requests" in text:
         return "http_429"
     if "token exchange failed" in text:
@@ -831,12 +899,17 @@ def _report_dynamic_proxy_result_if_needed(
     proxy_url: Optional[str],
     task_uuid: str,
     outcome: str,
+    phase: str = "",
     error_message: str = "",
 ) -> None:
-    if not dynamic_proxy_used:
-        return
     runtime_proxy = str(proxy_url or "").strip()
     if not runtime_proxy:
+        return
+
+    normalized_phase = str(phase or "").strip().lower()
+    normalized_error = str(error_message or "").strip().lower()
+    if normalized_phase in {"", "init"} and normalized_error.startswith("创建邮箱失败"):
+        logger.info("任务 %s 在邮箱创建阶段失败，跳过代理结果上报: %s", task_uuid, runtime_proxy)
         return
 
     try:
@@ -844,8 +917,6 @@ def _report_dynamic_proxy_result_if_needed(
 
         settings = get_settings()
         report_url = str(getattr(settings, "proxy_dynamic_report_url", "") or "").strip()
-        if not report_url:
-            return
 
         api_key = settings.proxy_dynamic_api_key.get_secret_value() if settings.proxy_dynamic_api_key else ""
         reason = _classify_proxy_report_reason(error_message, outcome)
@@ -1072,6 +1143,12 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 batch_wait_slice_seconds=batch_wait_slice_seconds,
                 check_cancelled=task_manager.create_check_cancelled_callback(task_uuid),
             )
+            existing_result = task.result if isinstance(task.result, dict) else {}
+            if existing_result:
+                try:
+                    engine.restore_deferred_context(existing_result)
+                except Exception as restore_exc:
+                    logger.warning("恢复任务上下文失败: task=%s error=%s", task_uuid, restore_exc)
 
             # 执行注册
             role_tag = normalize_role_tag(registration_type)
@@ -1199,6 +1276,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     proxy_url=openai_proxy_url,
                     task_uuid=task_uuid,
                     outcome="completed",
+                    phase=str(getattr(result, "phase", "") or ""),
                     error_message="",
                 )
 
@@ -1238,6 +1316,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     proxy_url=openai_proxy_url,
                     task_uuid=task_uuid,
                     outcome=outcome.get("outcome", "failed"),
+                    phase=str(getattr(result, "phase", "") or ""),
                     error_message=result.error_message,
                 )
                 return outcome
@@ -1279,6 +1358,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         proxy_url=openai_proxy_url,
                         task_uuid=task_uuid,
                         outcome=outcome.get("outcome", "failed"),
+                        phase=str(getattr(failure_result, "phase", "") or ""),
                         error_message=str(e),
                     )
                     return outcome
@@ -1957,6 +2037,10 @@ async def delete_task(task_uuid: str):
 @router.get("/stats")
 async def get_registration_stats():
     """获取注册统计信息"""
+    cached = _get_cached_registration_stats()
+    if cached is not None:
+        return cached
+
     with get_db() as db:
         from sqlalchemy import func
 
@@ -1982,7 +2066,7 @@ async def get_registration_stats():
         today_total = today_success + today_failed
         today_success_rate = round((today_success / today_total) * 100, 1) if today_total > 0 else 0.0
 
-        return {
+        payload = {
             "by_status": {status: count for status, count in status_stats},
             "today_count": today_total,
             "today_total": today_total,
@@ -1991,6 +2075,8 @@ async def get_registration_stats():
             "today_success_rate": today_success_rate,
             "today_by_status": today_by_status,
         }
+        _set_cached_registration_stats(payload)
+        return payload
 
 
 @router.get("/available-services")

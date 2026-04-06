@@ -8,6 +8,8 @@ from typing import Any, Optional
 class RegistrationReasonCode(str, Enum):
     EMAIL_OTP_TIMEOUT = "email_otp_timeout"
     OAUTH_CALLBACK_MISS = "oauth_callback_miss"
+    TOKEN_PASSWORD_PENDING = "token_password_pending"
+    TOKEN_PASSWORD_UNCONFIRMED = "token_password_unconfirmed"
     PRIMARYAPI_SERVER_ERROR = "primaryapi_server_error"
     REGISTRATION_DISALLOWED = "registration_disallowed"
     NETWORK_TIMEOUT = "network_timeout"
@@ -42,6 +44,20 @@ def classify_registration_failure(
     if "未命中 oauth 回调" in text or "重定向链回到了登录页" in text:
         return RegistrationFailureDecision(
             reason_code=RegistrationReasonCode.OAUTH_CALLBACK_MISS,
+            retryable=True,
+            detail=error_message,
+        )
+
+    if "账号已确认进入登录链路" in text and "登录密码暂未生效" in text:
+        return RegistrationFailureDecision(
+            reason_code=RegistrationReasonCode.TOKEN_PASSWORD_PENDING,
+            retryable=True,
+            detail=error_message,
+        )
+
+    if "账号状态尚未确认" in text and "登录密码当前被拒绝" in text:
+        return RegistrationFailureDecision(
+            reason_code=RegistrationReasonCode.TOKEN_PASSWORD_UNCONFIRMED,
             retryable=True,
             detail=error_message,
         )

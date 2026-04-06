@@ -106,6 +106,45 @@ def test_get_candidate_domains_respects_zero_exploratory_slots(monkeypatch, tmp_
     assert candidates == ["a.example.com"]
 
 
+def test_get_candidate_domains_cold_start_prefers_first_healthy_domain(monkeypatch, tmp_path):
+    health_path = tmp_path / "cloud_mail_domain_health.json"
+    monkeypatch.setattr(CloudMailService, "_health_store_path", staticmethod(lambda: health_path))
+    _reset_cloud_mail_state()
+
+    service = CloudMailService(
+        {
+            "base_url": "https://mail.example.com",
+            "admin_email": "admin@example.com",
+            "admin_password": "secret",
+            "domain": ["a.example.com", "b.example.com"],
+        }
+    )
+
+    assert service._get_candidate_domains() == ["a.example.com"]
+
+
+def test_get_candidate_domains_cold_start_moves_off_failed_domain(monkeypatch, tmp_path):
+    health_path = tmp_path / "cloud_mail_domain_health.json"
+    monkeypatch.setattr(CloudMailService, "_health_store_path", staticmethod(lambda: health_path))
+    _reset_cloud_mail_state()
+
+    service = CloudMailService(
+        {
+            "base_url": "https://mail.example.com",
+            "admin_email": "admin@example.com",
+            "admin_password": "secret",
+            "domain": ["a.example.com", "b.example.com"],
+        }
+    )
+    service.report_registration_outcome(
+        "tester@a.example.com",
+        success=False,
+        error_message="注册密码接口返回异常: Failed to create account. Please try again.",
+    )
+
+    assert service._get_candidate_domains() == ["b.example.com"]
+
+
 def test_report_registration_outcome_success_releases_inflight(monkeypatch, tmp_path):
     health_path = tmp_path / "cloud_mail_domain_health.json"
     monkeypatch.setattr(CloudMailService, "_health_store_path", staticmethod(lambda: health_path))
@@ -118,6 +157,29 @@ def test_report_registration_outcome_success_releases_inflight(monkeypatch, tmp_
 
     snapshot = service.get_domain_health_snapshot()
     assert snapshot["domain_states"]["a.example.com"]["inflight_count"] == 0
+
+
+def test_get_candidate_domains_rotates_exploratory_domains(monkeypatch, tmp_path):
+    health_path = tmp_path / "cloud_mail_domain_health.json"
+    monkeypatch.setattr(CloudMailService, "_health_store_path", staticmethod(lambda: health_path))
+    _reset_cloud_mail_state()
+
+    service = CloudMailService(
+        {
+            "base_url": "https://mail.example.com",
+            "admin_email": "admin@example.com",
+            "admin_password": "secret",
+            "domain": ["a.example.com", "b.example.com", "c.example.com"],
+            "exploratory_probe_slots": 1,
+        }
+    )
+    service.report_registration_outcome("tester@a.example.com", success=True)
+
+    first = service._get_candidate_domains()
+    second = service._get_candidate_domains()
+
+    assert first == ["a.example.com", "b.example.com"]
+    assert second == ["a.example.com", "c.example.com"]
 
 
 def test_create_email_falls_back_and_records_domain_failure(monkeypatch, tmp_path):

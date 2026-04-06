@@ -12,10 +12,25 @@ from ..auth import is_websocket_authenticated, websocket_auth_failure
 from ..task_manager import task_manager
 from ...database import crud
 from ...database.session import get_db
-from .registration import _finalize_cancelled_task, _request_batch_cancel
+from .registration import _finalize_cancelled_task, _get_reason_text, _request_batch_cancel
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "cancelling", "deferred"}
+
+
+def _build_terminal_task_payload(task_uuid: str, task) -> dict:
+    result = task.result if isinstance(task.result, dict) else {}
+    return {
+        "type": "status",
+        "task_uuid": task_uuid,
+        "status": task.status,
+        "email": result.get("email"),
+        "error_message": getattr(task, "error_message", None),
+        "reason_code": getattr(task, "reason_code", None),
+        "reason_text": _get_reason_text(getattr(task, "reason_code", None)),
+        "next_retry_at": task.next_retry_at.isoformat() if getattr(task, "next_retry_at", None) else None,
+    }
 
 
 @router.websocket("/ws/task/{task_uuid}")
@@ -34,6 +49,13 @@ async def task_websocket(websocket: WebSocket, task_uuid: str):
         await websocket.close(code=code, reason=reason)
         return
     await websocket.accept()
+
+    with get_db() as db:
+        task = crud.get_registration_task(db, task_uuid)
+        if task and task.status in TERMINAL_TASK_STATUSES:
+            await websocket.send_json(_build_terminal_task_payload(task_uuid, task))
+            await websocket.close(code=1000, reason="任务已结束")
+            return
 
     # 注册连接（会记录当前日志数量，避免重复发送历史日志）
     task_manager.register_websocket(task_uuid, websocket)

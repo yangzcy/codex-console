@@ -4,13 +4,15 @@
 
 import logging
 import os
+import time
 from typing import Optional, Any, Dict, List, Tuple, Set
 from urllib.parse import urlparse
 
+from curl_cffi import requests as cffi_requests
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 
-from ...config.settings import get_settings, update_settings
+from ...config.settings import Settings, get_settings, update_settings
 from ...database import crud
 from ...database.models import Proxy
 from ...database.session import get_db
@@ -42,6 +44,20 @@ class ProxySettings(BaseModel):
     port: int = 7890
     username: Optional[str] = None
     password: Optional[str] = None
+
+
+class StaticProxySettings(ProxySettings):
+    """静态代理设置"""
+    clear_password: bool = False
+
+
+class ProxyConnectivityResult(BaseModel):
+    """代理连通性测试结果"""
+    success: bool
+    message: str
+    ip: Optional[str] = None
+    response_time: Optional[int] = None
+    proxy_url: Optional[str] = None
 
 
 class RegistrationSettings(BaseModel):
@@ -115,12 +131,63 @@ def _verify_auto_quick_refresh_settings_persisted(
     return len(mismatches) == 0, mismatches
 
 
+def _build_static_proxy_url(proxy_settings: ProxySettings) -> Optional[str]:
+    """按 Settings.proxy_url 逻辑拼装静态代理 URL。"""
+    settings = Settings(
+        proxy_enabled=proxy_settings.enabled,
+        proxy_type=proxy_settings.type,
+        proxy_host=proxy_settings.host,
+        proxy_port=proxy_settings.port,
+        proxy_username=proxy_settings.username,
+        proxy_password=proxy_settings.password,
+    )
+    return settings.proxy_url
+
+
+def _test_proxy_connectivity(proxy_url: str) -> ProxyConnectivityResult:
+    """测试代理连通性。"""
+    test_url = "https://api.ipify.org?format=json"
+    start_time = time.time()
+
+    try:
+        proxies = {"http": proxy_url, "https": proxy_url}
+        response = cffi_requests.get(
+            test_url,
+            proxies=proxies,
+            timeout=10,
+            impersonate="chrome110",
+        )
+        elapsed_ms = round((time.time() - start_time) * 1000)
+
+        if response.status_code == 200:
+            ip = response.json().get("ip", "")
+            return ProxyConnectivityResult(
+                success=True,
+                proxy_url=proxy_url,
+                ip=ip,
+                response_time=elapsed_ms,
+                message=f"代理连接成功，出口 IP: {ip}，响应时间: {elapsed_ms}ms",
+            )
+
+        return ProxyConnectivityResult(
+            success=False,
+            proxy_url=proxy_url,
+            message=f"代理返回错误状态码: {response.status_code}",
+        )
+    except Exception as e:
+        return ProxyConnectivityResult(
+            success=False,
+            proxy_url=proxy_url,
+            message=f"代理连接失败: {str(e)}",
+        )
+
+
 # ============== API Endpoints ==============
 
 @router.get("")
 async def get_all_settings():
     """获取所有设置"""
-    settings = get_settings()
+    settings = get_settings(force_reload=True)
 
     entry_flow_raw = str(settings.registration_entry_flow or "native").strip().lower()
     entry_flow = "abcard" if entry_flow_raw == "abcard" else "native"
@@ -256,7 +323,7 @@ async def update_circuit_breaker_settings(request: CircuitBreakerSettings):
 @router.get("/proxy/dynamic")
 async def get_dynamic_proxy_settings():
     """获取动态代理设置"""
-    settings = get_settings()
+    settings = get_settings(force_reload=True)
     return {
         "enabled": settings.proxy_dynamic_enabled,
         "api_url": settings.proxy_dynamic_api_url,
@@ -264,6 +331,20 @@ async def get_dynamic_proxy_settings():
         "api_key_header": settings.proxy_dynamic_api_key_header,
         "result_field": settings.proxy_dynamic_result_field,
         "has_api_key": bool(settings.proxy_dynamic_api_key and settings.proxy_dynamic_api_key.get_secret_value()),
+    }
+
+
+@router.get("/proxy/static")
+async def get_static_proxy_settings():
+    """获取静态代理设置"""
+    settings = get_settings(force_reload=True)
+    return {
+        "enabled": settings.proxy_enabled,
+        "type": settings.proxy_type,
+        "host": settings.proxy_host,
+        "port": settings.proxy_port,
+        "username": settings.proxy_username,
+        "has_password": bool(settings.proxy_password and settings.proxy_password.get_secret_value()),
     }
 
 
@@ -294,6 +375,60 @@ async def update_dynamic_proxy_settings(request: DynamicProxySettings):
     return {"success": True, "message": "动态代理设置已更新"}
 
 
+@router.post("/proxy/static")
+async def update_static_proxy_settings(request: StaticProxySettings):
+    """更新静态代理设置"""
+    settings = get_settings(force_reload=True)
+    proxy_password = None
+
+    if request.clear_password:
+        proxy_password = ""
+    elif request.password is not None and request.password != "":
+        proxy_password = request.password
+    elif settings.proxy_password:
+        proxy_password = settings.proxy_password.get_secret_value()
+    else:
+        proxy_password = ""
+
+    update_settings(
+        proxy_enabled=bool(request.enabled),
+        proxy_type=request.type,
+        proxy_host=request.host,
+        proxy_port=request.port,
+        proxy_username=request.username,
+        proxy_password=proxy_password,
+    )
+    return {"success": True, "message": "静态代理设置已更新"}
+
+
+@router.post("/proxy/static/test")
+async def test_static_proxy(request: StaticProxySettings):
+    """测试静态代理"""
+    settings = get_settings(force_reload=True)
+
+    password = ""
+    if request.clear_password:
+        password = ""
+    elif request.password is not None and request.password != "":
+        password = request.password
+    elif settings.proxy_password:
+        password = settings.proxy_password.get_secret_value()
+
+    proxy_settings = ProxySettings(
+        enabled=True,
+        type=request.type,
+        host=request.host,
+        port=request.port,
+        username=request.username,
+        password=password or None,
+    )
+    proxy_url = _build_static_proxy_url(proxy_settings)
+    if not proxy_url:
+        raise HTTPException(status_code=400, detail="请填写有效的静态代理配置")
+
+    return _test_proxy_connectivity(proxy_url).model_dump()
+
+
 @router.post("/proxy/dynamic/test")
 async def test_dynamic_proxy(request: DynamicProxySettings):
     """测试动态代理 API"""
@@ -305,7 +440,7 @@ async def test_dynamic_proxy(request: DynamicProxySettings):
     # 若未传入 api_key，使用已保存的
     api_key = request.api_key or ""
     if not api_key:
-        settings = get_settings()
+        settings = get_settings(force_reload=True)
         if settings.proxy_dynamic_api_key:
             api_key = settings.proxy_dynamic_api_key.get_secret_value()
 
@@ -319,26 +454,7 @@ async def test_dynamic_proxy(request: DynamicProxySettings):
     if not proxy_url:
         return {"success": False, "message": "动态代理 API 返回为空或请求失败"}
 
-    # 用获取到的代理测试连通性
-    import time
-    from curl_cffi import requests as cffi_requests
-    try:
-        proxies = {"http": proxy_url, "https": proxy_url}
-        start = time.time()
-        resp = cffi_requests.get(
-            "https://api.ipify.org?format=json",
-            proxies=proxies,
-            timeout=10,
-            impersonate="chrome110"
-        )
-        elapsed = round((time.time() - start) * 1000)
-        if resp.status_code == 200:
-            ip = resp.json().get("ip", "")
-            return {"success": True, "proxy_url": proxy_url, "ip": ip, "response_time": elapsed,
-                    "message": f"动态代理可用，出口 IP: {ip}，响应时间: {elapsed}ms"}
-        return {"success": False, "proxy_url": proxy_url, "message": f"代理连接失败: HTTP {resp.status_code}"}
-    except Exception as e:
-        return {"success": False, "proxy_url": proxy_url, "message": f"代理连接失败: {e}"}
+    return _test_proxy_connectivity(proxy_url).model_dump()
 
 
 @router.get("/registration")
@@ -999,108 +1115,28 @@ async def set_proxy_default(proxy_id: int):
 @router.post("/proxies/{proxy_id}/test")
 async def test_proxy_item(proxy_id: int):
     """测试单个代理"""
-    import time
-    from curl_cffi import requests as cffi_requests
-
     with get_db() as db:
         proxy = crud.get_proxy_by_id(db, proxy_id)
         if not proxy:
             raise HTTPException(status_code=404, detail="代理不存在")
 
-        proxy_url = proxy.proxy_url
-        test_url = "https://api.ipify.org?format=json"
-        start_time = time.time()
-
-        try:
-            proxies = {
-                "http": proxy_url,
-                "https": proxy_url
-            }
-
-            response = cffi_requests.get(
-                test_url,
-                proxies=proxies,
-                timeout=3,
-                impersonate="chrome110"
-            )
-
-            elapsed_time = time.time() - start_time
-
-            if response.status_code == 200:
-                ip_info = response.json()
-                return {
-                    "success": True,
-                    "ip": ip_info.get("ip", ""),
-                    "response_time": round(elapsed_time * 1000),
-                    "message": f"代理连接成功，出口 IP: {ip_info.get('ip', 'unknown')}"
-                }
-            else:
-                return {
-                    "success": False,
-                    "message": f"代理返回错误状态码: {response.status_code}"
-                }
-
-        except Exception as e:
-            return {
-                "success": False,
-                "message": f"代理连接失败: {str(e)}"
-            }
+        return _test_proxy_connectivity(proxy.proxy_url).model_dump()
 
 
 @router.post("/proxies/test-all")
 async def test_all_proxies():
     """测试所有启用的代理"""
-    import time
-    from curl_cffi import requests as cffi_requests
-
     with get_db() as db:
         proxies = crud.get_enabled_proxies(db)
 
         results = []
         for proxy in proxies:
-            proxy_url = proxy.proxy_url
-            test_url = "https://api.ipify.org?format=json"
-            start_time = time.time()
-
-            try:
-                proxies_dict = {
-                    "http": proxy_url,
-                    "https": proxy_url
-                }
-
-                response = cffi_requests.get(
-                    test_url,
-                    proxies=proxies_dict,
-                    timeout=3,
-                    impersonate="chrome110"
-                )
-
-                elapsed_time = time.time() - start_time
-
-                if response.status_code == 200:
-                    ip_info = response.json()
-                    results.append({
-                        "id": proxy.id,
-                        "name": proxy.name,
-                        "success": True,
-                        "ip": ip_info.get("ip", ""),
-                        "response_time": round(elapsed_time * 1000)
-                    })
-                else:
-                    results.append({
-                        "id": proxy.id,
-                        "name": proxy.name,
-                        "success": False,
-                        "message": f"状态码: {response.status_code}"
-                    })
-
-            except Exception as e:
-                results.append({
-                    "id": proxy.id,
-                    "name": proxy.name,
-                    "success": False,
-                    "message": str(e)
-                })
+            result = _test_proxy_connectivity(proxy.proxy_url).model_dump()
+            result.update({
+                "id": proxy.id,
+                "name": proxy.name,
+            })
+            results.append(result)
 
         success_count = sum(1 for r in results if r["success"])
         return {

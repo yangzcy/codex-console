@@ -799,12 +799,14 @@ class Settings(BaseModel):
 _settings: Optional[Settings] = None
 
 
-def get_settings() -> Settings:
+def get_settings(*, force_reload: bool = False) -> Settings:
     """
     获取全局配置实例（单例模式）
     完全从数据库加载配置
     """
     global _settings
+    if force_reload:
+        _settings = None
     if _settings is None:
         # 先初始化默认设置（如果数据库中没有的话）
         init_default_settings()
@@ -819,16 +821,16 @@ def update_settings(**kwargs) -> Settings:
     更新配置并保存到数据库
     """
     global _settings
-    if _settings is None:
-        _settings = get_settings()
 
-    # 创建新的配置实例
-    updated_data = _settings.model_dump()
+    # 始终以数据库最新值为基准，避免基于进程内过期缓存合成新配置
+    current_settings = get_settings(force_reload=True)
+    updated_data = current_settings.model_dump()
     updated_data.update(kwargs)
-    _settings = Settings(**updated_data)
+    updated_settings = Settings(**updated_data)
 
-    # 保存到数据库
-    _save_settings_to_db(**kwargs)
+    # 先保存到数据库，再立即回读，确保返回值与进程内缓存一致
+    _save_settings_to_db(**updated_settings.model_dump())
+    _settings = get_settings(force_reload=True)
 
     return _settings
 
