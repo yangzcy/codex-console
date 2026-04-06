@@ -34,6 +34,9 @@ def fallback_resume_phase(reason_code: str, current_phase: str | None) -> Regist
     if reason_code == "oauth_callback_miss":
         return RegistrationPhase.LOGIN_OTP_VERIFIED
 
+    if reason_code in {"token_password_pending", "token_password_unconfirmed"}:
+        return phase
+
     if reason_code == "registration_disallowed":
         return RegistrationPhase.SIGNUP_OTP_VERIFIED
 

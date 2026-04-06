@@ -4,7 +4,6 @@ Cloud Mail 邮箱服务实现
 """
 
 import re
-import sys
 import time
 import logging
 import random
@@ -86,6 +85,15 @@ class CloudMailService(BaseEmailService):
     _runtime_domain_block_until: Dict[str, float] = {}
     _domain_inflight_allocations: Dict[str, int] = {}
 
+    @staticmethod
+    def _emit_runtime_event(message: str, level: str = "info") -> None:
+        if level == "warning":
+            logger.warning(message)
+        elif level == "error":
+            logger.error(message)
+        else:
+            logger.info(message)
+
     def __init__(self, config: Dict[str, Any] = None, name: str = None):
         """
         初始化 Cloud Mail 服务
@@ -144,6 +152,7 @@ class CloudMailService(BaseEmailService):
         self._created_emails: Dict[str, Dict[str, Any]] = {}
         self._stage_seen_mail_ids: Dict[str, set] = {}
         self._last_used_mail_ids: Dict[str, str] = {}
+        self._last_runtime_metrics: Dict[str, Any] = {}
 
     @staticmethod
     def _health_store_path() -> Path:
@@ -319,14 +328,7 @@ class CloudMailService(BaseEmailService):
 
     @staticmethod
     def _bootstrap_domain_order(configured_domains: List[str], ordered_domains: List[str]) -> List[str]:
-        if not ordered_domains:
-            return []
-        configured_index = {domain: idx for idx, domain in enumerate(configured_domains)}
-        return sorted(
-            ordered_domains,
-            key=lambda domain: configured_index.get(domain, -1),
-            reverse=True,
-        )
+        return list(ordered_domains or [])
 
     def _select_domain(self, requested_domain: Any = None) -> str:
         configured_domains = self._normalize_domain_list(
@@ -400,12 +402,20 @@ class CloudMailService(BaseEmailService):
                 ]
                 probe_slots = max(0, int(self.config.get("exploratory_probe_slots") or 0))
                 if available_exploratory:
-                    return proven_domains + available_exploratory[:probe_slots]
+                    if probe_slots <= 0:
+                        return proven_domains
+                    rotation_key = f"{base_url}::{','.join(available_exploratory)}"
+                    next_offset = CloudMailService._domain_rotation_offsets.get(rotation_key, 0)
+                    rotated = available_exploratory[next_offset:] + available_exploratory[:next_offset]
+                    CloudMailService._domain_rotation_offsets[rotation_key] = (
+                        (next_offset + 1) % len(available_exploratory)
+                    )
+                    return proven_domains + rotated[:probe_slots]
                 return proven_domains
 
             # 冷启动阶段：健康池被清空后，先只放一个引导域名做 canary。
-            # 这里优先取配置里的最后一个域名，且在出现 proven 域名前不放行其他新域名，
-            # 避免首批并发把 maia/maib/maic 之类探索域名先打出失败。
+            # 这里固定取健康排序后的首选域名，在出现 proven 域名前不放行其他新域名，
+            # 避免首批并发把多个探索域名同时打坏；同时不要对“配置里的最后一个域名”产生偏置。
             bootstrap_order = self._bootstrap_domain_order(configured_domains, ordered)
             bootstrap_domain = bootstrap_order[0] if bootstrap_order else ordered[0]
             return [bootstrap_domain]
@@ -567,6 +577,9 @@ class CloudMailService(BaseEmailService):
     def get_domain_health_snapshot(self) -> Dict[str, Any]:
         return self._collect_domain_health_snapshot()
 
+    def get_runtime_metrics(self) -> Dict[str, Any]:
+        return dict(self._last_runtime_metrics or {})
+
     def _generate_token(self) -> str:
         """
         生成身份令牌
@@ -642,7 +655,7 @@ class CloudMailService(BaseEmailService):
             token = self._generate_token()
             expires_at = time.time() + 3600  # 1 小时后过期
             CloudMailService._shared_tokens[base_url] = (token, expires_at)
-            print(f"[CloudMail] Token已刷新，所有实例将使用新token", flush=True)
+            self._emit_runtime_event("[CloudMail] Token 已刷新，后续实例将复用新 token")
             return token
 
     def _get_headers(self, token: Optional[str] = None) -> Dict[str, str]:
@@ -834,6 +847,11 @@ class CloudMailService(BaseEmailService):
                         "domain": selected_domain,
                         "domain_health_snapshot": self._collect_domain_health_snapshot(specified_domain),
                     }
+                    self._last_runtime_metrics = {
+                        "service_type": self.service_type.value,
+                        "selected_domain": selected_domain,
+                        "create_email_status": "success",
+                    }
 
                     self._created_emails[email_address] = email_info
                     with CloudMailService._domain_health_lock:
@@ -848,6 +866,12 @@ class CloudMailService(BaseEmailService):
                 except Exception as e:
                     last_error = e
                     error_text = str(e or "")
+                    self._last_runtime_metrics = {
+                        "service_type": self.service_type.value,
+                        "selected_domain": selected_domain,
+                        "create_email_status": "failed",
+                        "create_email_error": error_text,
+                    }
                     if "非法邮箱域名" in error_text:
                         self._cooldown_domain(
                             selected_domain,
@@ -1041,32 +1065,61 @@ class CloudMailService(BaseEmailService):
                     seen_ids.add(best_mail_id)
                     self._last_used_mail_ids[email] = best_mail_id
                     code = str(best["code"])
-                    print(f"[CloudMail] ✅ 找到验证码: {code}", flush=True)
-                    sys.stdout.flush()
+                    self._last_runtime_metrics = {
+                        "service_type": self.service_type.value,
+                        "mailbox_email": email,
+                        "otp_poll_count": check_count,
+                        "mail_list_size": len(emails),
+                        "seen_mail_count": len(seen_ids),
+                        "selected_mail_id": best_mail_id,
+                        "selected_mail_has_timestamp": bool(best.get("has_ts")),
+                        "selected_mail_is_recent": bool(best.get("is_recent")),
+                        "otp_fetch_status": "success",
+                    }
+                    self._emit_runtime_event(
+                        f"[CloudMail] 找到验证码: {code} (email={email}, mail_id={best_mail_id})"
+                    )
                     self.update_status(True)
                     return code
 
             except Exception as e:
                 last_error = e
-                print(f"[CloudMail] 异常: {e}", flush=True)
-                sys.stdout.flush()
+                self._last_runtime_metrics = {
+                    "service_type": self.service_type.value,
+                    "mailbox_email": email,
+                    "otp_poll_count": check_count,
+                    "seen_mail_count": len(seen_ids),
+                    "otp_fetch_status": "error",
+                    "otp_fetch_error": str(e or ""),
+                }
+                self._emit_runtime_event(f"[CloudMail] 拉取验证码异常: {e}", "warning")
                 # 如果是认证错误，强制刷新token
                 if "401" in str(e) or "认证" in str(e):
-                    print(f"[CloudMail] 检测到认证错误，强制刷新token", flush=True)
-                    sys.stdout.flush()
+                    self._emit_runtime_event("[CloudMail] 检测到认证异常，尝试强制刷新 token", "warning")
                     try:
                         self._get_token(force_refresh=True)
                     except Exception as refresh_error:
-                        print(f"[CloudMail] 刷新token失败: {refresh_error}", flush=True)
-                        sys.stdout.flush()
+                        self._emit_runtime_event(
+                            f"[CloudMail] 强制刷新 token 失败: {refresh_error}",
+                            "error",
+                        )
                 logger.error(f"检查邮件时出错: {e}", exc_info=True)
 
             time.sleep(poll_interval)
 
         if last_error:
             logger.warning(f"等待 Cloud Mail 验证码超时: {email}，最后一次错误: {last_error}")
-        print(f"[CloudMail] 超时！检查{check_count}次，已处理: {list(seen_ids)}", flush=True)
-        sys.stdout.flush()
+        self._emit_runtime_event(
+            f"[CloudMail] 等待验证码超时: email={email}, 检查次数={check_count}, 已处理邮件数={len(seen_ids)}",
+            "warning",
+        )
+        self._last_runtime_metrics = {
+            "service_type": self.service_type.value,
+            "mailbox_email": email,
+            "otp_poll_count": check_count,
+            "seen_mail_count": len(seen_ids),
+            "otp_fetch_status": "timeout",
+        }
         return None
 
     def list_emails(self, **kwargs) -> List[Dict[str, Any]]:

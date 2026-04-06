@@ -53,6 +53,7 @@ CURRENT_ACCOUNT_SETTING_KEY = "codex.current_account_id"
 OVERVIEW_EXTRA_DATA_KEY = "codex_overview"
 OVERVIEW_CARD_REMOVED_KEY = "codex_overview_card_removed"
 OVERVIEW_CACHE_TTL_SECONDS = 300  # 5 分钟
+HOME_ACCOUNT_LIST_CACHE_TTL_SECONDS = 5
 PAID_SUBSCRIPTION_TYPES = ("plus", "team")
 INVALID_ACCOUNT_STATUSES = (
     AccountStatus.FAILED.value,
@@ -81,6 +82,48 @@ _account_async_executor = ThreadPoolExecutor(
     max_workers=ACCOUNT_ASYNC_EXECUTOR_MAX_WORKERS,
     thread_name_prefix="account_async",
 )
+_home_account_list_cache: Dict[str, Any] = {
+    "expires_at": 0.0,
+    "payload": None,
+}
+_home_account_list_cache_lock = threading.Lock()
+
+
+def _is_home_account_list_query(
+    *,
+    page: int,
+    page_size: int,
+    status: Optional[str],
+    email_service: Optional[str],
+    role_tag: Optional[str],
+    pool_state: Optional[str],
+    biz_tag: Optional[str],
+    search: Optional[str],
+) -> bool:
+    return (
+        page == 1
+        and page_size == 10
+        and not status
+        and not email_service
+        and not role_tag
+        and not pool_state
+        and not biz_tag
+        and not search
+    )
+
+
+def _get_cached_home_account_list() -> Optional["AccountListResponse"]:
+    now = time.monotonic()
+    with _home_account_list_cache_lock:
+        if _home_account_list_cache["expires_at"] > now:
+            return _home_account_list_cache["payload"]
+    return None
+
+
+def _set_cached_home_account_list(payload: "AccountListResponse") -> None:
+    with _home_account_list_cache_lock:
+        _home_account_list_cache["payload"] = payload
+        _home_account_list_cache["expires_at"] = time.monotonic() + HOME_ACCOUNT_LIST_CACHE_TTL_SECONDS
 
 
 def _get_proxy(request_proxy: Optional[str] = None) -> Optional[str]:
@@ -1277,6 +1320,20 @@ async def list_accounts(
 
     支持分页、状态筛选、邮箱服务筛选和搜索
     """
+    if _is_home_account_list_query(
+        page=page,
+        page_size=page_size,
+        status=status,
+        email_service=email_service,
+        role_tag=role_tag,
+        pool_state=pool_state,
+        biz_tag=biz_tag,
+        search=search,
+    ):
+        cached = _get_cached_home_account_list()
+        if cached is not None:
+            return cached
+
     with get_db() as db:
         # 构建查询
         query = db.query(Account)
@@ -1326,10 +1383,22 @@ async def list_accounts(
         offset = (page - 1) * page_size
         accounts = query.order_by(Account.created_at.desc()).offset(offset).limit(page_size).all()
 
-        return AccountListResponse(
+        response = AccountListResponse(
             total=total,
             accounts=[account_to_response(acc) for acc in accounts]
         )
+        if _is_home_account_list_query(
+            page=page,
+            page_size=page_size,
+            status=status,
+            email_service=email_service,
+            role_tag=role_tag,
+            pool_state=pool_state,
+            biz_tag=biz_tag,
+            search=search,
+        ):
+            _set_cached_home_account_list(response)
+        return response
 
 
 @router.get("/overview/cards")

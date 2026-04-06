@@ -4,7 +4,12 @@ import json
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
-from src.core.register import RegistrationEngine, RegistrationResult, SignupFormResult
+from src.core.register import (
+    REGISTRATION_DISALLOWED_SUBDOMAIN_MESSAGE,
+    RegistrationEngine,
+    RegistrationResult,
+    SignupFormResult,
+)
 from src.services.base import BaseEmailService
 
 
@@ -63,6 +68,7 @@ class FakeEmailService(BaseEmailService):
         super().__init__(EmailServiceType.TEMPMAIL)
         self.codes = list(codes)
         self.otp_requests = []
+        self.runtime_metrics = {}
 
     def create_email(self, config=None):
         return {
@@ -98,6 +104,9 @@ class FakeEmailService(BaseEmailService):
 
     def check_health(self):
         return True
+
+    def get_runtime_metrics(self):
+        return dict(self.runtime_metrics or {})
 
 
 class FakeOAuthManager:
@@ -641,6 +650,142 @@ def test_run_retries_with_fresh_email_when_create_account_reports_existing_user(
     assert complete_calls == ["retry-2@example.com"]
 
 
+def test_run_preserves_registration_disallowed_reason_when_fresh_email_retries_exhausted():
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine._check_ip_location = lambda: (True, "US")
+
+    created_emails = []
+
+    def fake_create_email():
+        idx = len(created_emails) + 1
+        email = f"retry-{idx}@example.com"
+        created_emails.append(email)
+        engine.email = email
+        engine.inbox_email = email
+        engine.email_info = {"email": email, "service_id": email}
+        return True
+
+    def fake_create_user_account():
+        engine._last_create_account_error_code = "registration_disallowed"
+        engine._last_create_account_error_message = (
+            "Sorry, we cannot create your account with the given information."
+        )
+        return False
+
+    engine._create_email = fake_create_email
+    engine._prepare_authorize_flow = lambda label: ("did-1", "sentinel-1")
+    engine._submit_signup_form = lambda did, sen: SignupFormResult(success=True)
+    engine._register_password = lambda did, sen: (True, "pw-1")
+    engine._send_verification_code = lambda referer=None: True
+    engine._verify_email_otp_with_retry = lambda *args, **kwargs: True
+    engine._create_user_account = fake_create_user_account
+
+    result = engine.run()
+
+    assert result.success is False
+    assert result.reason_code == "registration_disallowed"
+    assert result.error_message == f"{REGISTRATION_DISALLOWED_SUBDOMAIN_MESSAGE} 当前失效域名: example.com"
+    assert created_emails == [
+        "retry-1@example.com",
+        "retry-2@example.com",
+        "retry-3@example.com",
+    ]
+    assert any(
+        REGISTRATION_DISALLOWED_SUBDOMAIN_MESSAGE in message
+        for message in (result.logs or [])
+    )
+
+
+def test_register_password_does_not_treat_login_password_probe_as_existing_account():
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.session = QueueSession([
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["register"],
+            DummyResponse(
+                status_code=400,
+                payload={
+                    "error": {
+                        "message": "Failed to create account. Please try again.",
+                        "code": None,
+                    }
+                },
+                text='{"error":{"message":"Failed to create account. Please try again.","code":null}}',
+            ),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["register"],
+            DummyResponse(
+                status_code=400,
+                payload={
+                    "error": {
+                        "message": "Failed to create account. Please try again.",
+                        "code": None,
+                    }
+                },
+                text='{"error":{"message":"Failed to create account. Please try again.","code":null}}',
+            ),
+        ),
+    ])
+    engine.email = "tester@example.com"
+    engine.inbox_email = "tester@example.com"
+    engine._wait_for_register_submission_slot = lambda: True
+    engine._sleep_interruptible = lambda seconds: True
+    engine._dump_session_cookies = lambda: ""
+    engine._collect_register_failure_diagnostics = lambda response: {"status_code": response.status_code}
+    engine._submit_login_start = lambda did, sen: SignupFormResult(
+        success=True,
+        page_type=OPENAI_PAGE_TYPES["LOGIN_PASSWORD"],
+        is_existing_account=False,
+    )
+
+    ok, password = engine._register_password("did-1", "sentinel-1")
+
+    assert ok is False
+    assert password is None
+    assert engine._is_existing_account is False
+    assert engine._token_acquisition_requires_login is False
+    assert engine._last_register_password_error == (
+        "注册密码接口返回异常: Failed to create account. Please try again."
+    )
+
+
+def test_mark_password_pending_result_uses_unconfirmed_reason_for_unconfirmed_account():
+    engine = RegistrationEngine(FakeEmailService([]), batch_wait_slice_seconds=15)
+    engine.email = "tester@example.com"
+    engine.password = "pw-1"
+    engine.device_id = "did-1"
+    engine._last_login_password_error_code = "invalid_username_or_password"
+    engine._last_login_password_error_message = "登录密码被拒绝，疑似密码尚未生效或账号密码与当前任务不一致"
+    result = RegistrationResult(success=False)
+
+    ok = engine._mark_password_pending_result(result, "重新登录提交密码失败")
+
+    assert ok is True
+    assert result.reason_code == "token_password_unconfirmed"
+    assert "账号状态尚未确认" in result.error_message
+    assert result.source == "register"
+
+
+def test_mark_password_pending_result_keeps_confirmed_reason_for_existing_account():
+    engine = RegistrationEngine(FakeEmailService([]), batch_wait_slice_seconds=15)
+    engine.email = "tester@example.com"
+    engine.password = "pw-1"
+    engine.device_id = "did-1"
+    engine._is_existing_account = True
+    engine._last_login_password_error_code = "invalid_username_or_password"
+    engine._last_login_password_error_message = "登录密码被拒绝，疑似密码尚未生效或账号密码与当前任务不一致"
+    result = RegistrationResult(success=False)
+
+    ok = engine._mark_password_pending_result(result, "重新登录提交密码失败")
+
+    assert ok is True
+    assert result.reason_code == "token_password_pending"
+    assert "账号已确认进入登录链路" in result.error_message
+    assert result.source == "login"
+
+
 def test_registration_result_to_dict_includes_phase_and_reason_code():
     result = RegistrationResult(
         success=False,
@@ -654,3 +799,61 @@ def test_registration_result_to_dict_includes_phase_and_reason_code():
 
     assert payload["phase"] == "signup_otp_waiting"
     assert payload["reason_code"] == "email_otp_timeout"
+
+
+def test_merge_email_service_runtime_metadata_includes_selected_domain_and_runtime_metrics():
+    email_service = FakeEmailService([])
+    email_service.runtime_metrics = {
+        "otp_fetch_status": "success",
+        "otp_poll_count": 2,
+    }
+    engine = RegistrationEngine(email_service, proxy_url="http://127.0.0.1:41085")
+    engine.email_info = {
+        "email": "tester@example.com",
+        "service_id": "mailbox-1",
+        "domain": "a.example.com",
+    }
+    engine._last_register_failure_diagnostics = {"status_code": 400, "cf-ray": "abc"}
+    result = RegistrationResult(success=False)
+
+    engine._merge_email_service_runtime_metadata(result)
+
+    assert result.metadata["proxy_used"] == "http://127.0.0.1:41085"
+    assert result.metadata["email_service_selected_domain"] == "a.example.com"
+    assert result.metadata["email_service_runtime_metrics"]["otp_fetch_status"] == "success"
+    assert result.metadata["email_service_runtime_metrics"]["otp_poll_count"] == 2
+    assert result.metadata["register_failure_diagnostics"]["status_code"] == 400
+
+
+def test_register_password_records_failure_diagnostics_for_task_result():
+    engine = RegistrationEngine(FakeEmailService([]), proxy_url="http://127.0.0.1:41085")
+    response = DummyResponse(
+        status_code=400,
+        payload={
+            "error": {
+                "message": "Failed to create account. Please try again.",
+                "code": None,
+            }
+        },
+        text='{"error":{"message":"Failed to create account. Please try again.","code":null}}',
+    )
+    engine.session = QueueSession([
+        ("POST", OPENAI_API_ENDPOINTS["register"], response),
+        ("POST", OPENAI_API_ENDPOINTS["register"], response),
+    ])
+    engine.email = "tester@example.com"
+    engine.inbox_email = "tester@example.com"
+    engine._wait_for_register_submission_slot = lambda: True
+    engine._sleep_interruptible = lambda seconds: True
+    engine._dump_session_cookies = lambda: ""
+    engine._collect_register_failure_diagnostics = lambda current_response: {
+        "status_code": current_response.status_code,
+        "proxy_url": engine.proxy_url,
+    }
+
+    ok, password = engine._register_password("did-1", "sentinel-1")
+
+    assert ok is False
+    assert password is None
+    assert engine._last_register_failure_diagnostics["status_code"] == 400
+    assert engine._last_register_failure_diagnostics["proxy_url"] == "http://127.0.0.1:41085"

@@ -94,7 +94,7 @@ def setup_application():
         raise
 
     # 获取配置（需要数据库已初始化）
-    settings = get_settings()
+    settings = get_settings(force_reload=True)
 
     # 配置日志（日志文件写到实际 logs 目录）
     log_file = str(logs_dir / Path(settings.log_file).name)

@@ -187,6 +187,14 @@ class BaseEmailService(abc.ABC):
         """
         return {}
 
+    def get_runtime_metrics(self) -> Dict[str, Any]:
+        """
+        返回邮箱服务最近一次运行时观测指标（可选实现）。
+
+        默认返回空字典，由需要暴露调试信息的服务自行覆盖。
+        """
+        return {}
+
     def wait_for_email(
         self,
         email: str,

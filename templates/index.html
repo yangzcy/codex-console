@@ -57,6 +57,30 @@
             font-size: 0.875rem;
         }
 
+        .task-diagnostic-panel {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: var(--spacing-sm);
+            padding: var(--spacing-md);
+            margin: 0 var(--spacing-md) var(--spacing-md);
+            background: var(--surface-hover);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius);
+        }
+
+        .task-diagnostic-item .label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-bottom: 4px;
+        }
+
+        .task-diagnostic-item .value {
+            font-size: 0.8125rem;
+            color: var(--text-primary);
+            word-break: break-word;
+            font-family: var(--font-mono);
+        }
+
         /* 已注册账号列表 */
         .recent-accounts-table {
             max-height: 300px;
@@ -369,8 +393,8 @@
                                 </div>
 
                                 <div class="form-group" id="batch-count-group" style="display: none;">
-                                    <label for="batch-count">正整数</label>
-                                    <input type="number" id="batch-count" name="batch_count" min="1" step="1" inputmode="numeric" placeholder="请输入正整数" title="请输入正整数" required value="5">
+                                    <label for="batch-count">注册上限</label>
+                                    <input type="number" id="batch-count" name="batch_count" min="1" step="1" inputmode="numeric" placeholder="正整数" title="请输入正整数" required value="5">
                                 </div>
 
                                 <div id="batch-options" style="display: none;">
@@ -474,6 +498,41 @@
                                 <div class="task-status-item">
                                     <div class="label">状态</div>
                                     <div class="value" id="task-status">-</div>
+                                </div>
+                            </div>
+
+                            <div class="task-diagnostic-panel" id="task-diagnostic-panel" style="display: none;">
+                                <div class="task-diagnostic-item">
+                                    <div class="label">原因类别</div>
+                                    <div class="value" id="task-reason-code">-</div>
+                                </div>
+                                <div class="task-diagnostic-item">
+                                    <div class="label">下次重试</div>
+                                    <div class="value" id="task-next-retry-at">-</div>
+                                </div>
+                                <div class="task-diagnostic-item">
+                                    <div class="label">选中域名</div>
+                                    <div class="value" id="task-selected-domain">-</div>
+                                </div>
+                                <div class="task-diagnostic-item">
+                                    <div class="label">建邮箱状态</div>
+                                    <div class="value" id="task-create-email-status">-</div>
+                                </div>
+                                <div class="task-diagnostic-item">
+                                    <div class="label">收码状态</div>
+                                    <div class="value" id="task-otp-fetch-status">-</div>
+                                </div>
+                                <div class="task-diagnostic-item">
+                                    <div class="label">轮询次数</div>
+                                    <div class="value" id="task-otp-poll-count">-</div>
+                                </div>
+                                <div class="task-diagnostic-item">
+                                    <div class="label">邮件列表数量</div>
+                                    <div class="value" id="task-mail-list-size">-</div>
+                                </div>
+                                <div class="task-diagnostic-item">
+                                    <div class="label">命中邮件 ID</div>
+                                    <div class="value" id="task-selected-mail-id">-</div>
                                 </div>
                             </div>
 

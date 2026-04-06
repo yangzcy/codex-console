@@ -58,6 +58,61 @@
 
             <!-- 代理设置 -->
             <div class="tab-content active" id="proxy-tab">
+                <!-- 静态代理配置 -->
+                <div class="card" style="margin-top: var(--spacing-lg);">
+                    <div class="card-header">
+                        <h3>静态代理配置</h3>
+                        <span class="hint">固定使用单个代理地址，独立于动态代理和代理列表</span>
+                    </div>
+                    <div class="card-body">
+                        <form id="static-proxy-form">
+                            <div class="form-group">
+                                <label>
+                                    <input type="checkbox" id="static-proxy-enabled" name="enabled">
+                                    启用静态代理
+                                </label>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="static-proxy-type">代理类型</label>
+                                    <select id="static-proxy-type" name="type">
+                                        <option value="http">HTTP</option>
+                                        <option value="socks5">SOCKS5</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="static-proxy-host">Host</label>
+                                    <input type="text" id="static-proxy-host" name="host" placeholder="127.0.0.1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="static-proxy-port">Port</label>
+                                    <input type="number" id="static-proxy-port" name="port" min="1" max="65535" placeholder="7890">
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="static-proxy-username">Username</label>
+                                    <input type="text" id="static-proxy-username" name="username" autocomplete="off">
+                                </div>
+                                <div class="form-group">
+                                    <label for="static-proxy-password">Password</label>
+                                    <input type="password" id="static-proxy-password" name="password" autocomplete="new-password" placeholder="未配置，留空表示不修改">
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>
+                                    <input type="checkbox" id="static-proxy-clear-password" name="clear_password">
+                                    清空已保存密码
+                                </label>
+                            </div>
+                            <div class="form-actions">
+                                <button type="submit" class="btn btn-primary">💾 保存静态代理</button>
+                                <button type="button" class="btn btn-secondary" id="test-static-proxy-btn">🔌 测试静态代理</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
                 <!-- 动态代理配置 -->
                 <div class="card" style="margin-top: var(--spacing-lg);">
                     <div class="card-header">

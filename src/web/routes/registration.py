@@ -6,6 +6,8 @@ import asyncio
 import logging
 import uuid
 import random
+import time
+import threading
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Tuple
 
@@ -23,6 +25,7 @@ from ...database.session import get_db
 from ...database.models import RegistrationTask, Proxy
 from ...core.register import RegistrationEngine, RegistrationResult
 from ...core.registration_failures import classify_registration_failure
+from ...core.mailbox_registry import MailboxRegistry
 from ...core.registration_retry_policy import build_retry_action
 from ..registration_task_scheduler import should_run_deferred_task
 from ...services import EmailServiceFactory, EmailServiceType
@@ -35,11 +38,33 @@ router = APIRouter()
 BATCH_OTP_WAIT_SLICE_SECONDS = 15
 BATCH_OTP_WAIT_RETRY_DELAY_SECONDS = 20
 BATCH_OTP_WAIT_MAX_DEFERS = 6
+REGISTRATION_STATS_CACHE_TTL_SECONDS = 5
 
 # 任务存储（简单的内存存储，生产环境应使用 Redis）
 running_tasks: dict = {}
 # 批量任务存储
 batch_tasks: Dict[str, dict] = {}
+_registration_stats_cache: Dict[str, object] = {
+    "expires_at": 0.0,
+    "payload": None,
+}
+_registration_stats_cache_lock = threading.Lock()
+
+
+def _get_cached_registration_stats() -> Optional[dict]:
+    now = time.monotonic()
+    with _registration_stats_cache_lock:
+        if _registration_stats_cache["expires_at"] > now:
+            payload = _registration_stats_cache["payload"]
+            if isinstance(payload, dict):
+                return dict(payload)
+    return None
+
+
+def _set_cached_registration_stats(payload: dict) -> None:
+    with _registration_stats_cache_lock:
+        _registration_stats_cache["payload"] = dict(payload)
+        _registration_stats_cache["expires_at"] = time.monotonic() + REGISTRATION_STATS_CACHE_TTL_SECONDS
 
 
 def _model_dump(data) -> dict:
@@ -219,13 +244,25 @@ def get_proxy_for_registration(db) -> Tuple[Optional[str], Optional[int]]:
     Returns:
         Tuple[proxy_url, proxy_id]: 代理 URL 和代理 ID（如果来自代理列表）
     """
-    # 先尝试从代理列表中获取
-    proxy = crud.get_random_proxy(db)
-    if proxy:
-        return proxy.proxy_url, proxy.id
+    from ...core.dynamic_proxy import get_proxy_url_for_task, is_proxy_cooling
+    from ...database.models import Proxy as ProxyModel
+    from sqlalchemy import asc, desc
+
+    # 先尝试从代理列表中获取，跳过本地冷却中的出口。
+    configured_proxies = (
+        db.query(ProxyModel)
+        .filter(ProxyModel.enabled == True)
+        .order_by(desc(ProxyModel.is_default), asc(ProxyModel.id))
+        .all()
+    )
+    for proxy in configured_proxies:
+        proxy_url = proxy.proxy_url
+        if is_proxy_cooling(proxy_url):
+            logger.warning("注册代理决策: 跳过冷却中的代理列表出口: %s", proxy_url)
+            continue
+        return proxy_url, proxy.id
 
     # 代理列表为空，尝试动态代理或静态代理
-    from ...core.dynamic_proxy import get_proxy_url_for_task
     proxy_url = get_proxy_url_for_task()
     if proxy_url:
         return proxy_url, None
@@ -306,12 +343,15 @@ class RegistrationTaskResponse(BaseModel):
     email_service: Optional[str] = None
     email_service_name: Optional[str] = None
     email: Optional[str] = None
+    email_service_selected_domain: Optional[str] = None
+    email_service_runtime_metrics: Optional[dict] = None
     proxy: Optional[str] = None
     logs: Optional[str] = None
     result: Optional[dict] = None
     error_message: Optional[str] = None
     phase: Optional[str] = None
     reason_code: Optional[str] = None
+    reason_text: Optional[str] = None
     defer_bucket: Optional[str] = None
     retry_count: Optional[int] = None
     next_retry_at: Optional[str] = None
@@ -386,10 +426,33 @@ class OutlookBatchRegistrationResponse(BaseModel):
 
 # ============== Helper Functions ==============
 
+REASON_CODE_TEXTS = {
+    "email_otp_timeout": "邮箱验证码超时",
+    "oauth_callback_miss": "OAuth 回调未命中",
+    "token_password_pending": "账号已确认进入登录链路，密码暂未生效",
+    "token_password_unconfirmed": "账号状态未确认，登录密码当前被拒绝",
+    "primaryapi_server_error": "上游服务异常",
+    "registration_disallowed": "当前邮箱域名被注册策略拒绝",
+    "network_timeout": "网络超时",
+    "proxy_pool_exhausted": "代理池耗尽",
+    "unknown_retryable": "可重试异常",
+}
+
+
+def _get_reason_text(reason_code: Optional[str]) -> Optional[str]:
+    key = str(reason_code or "").strip()
+    if not key:
+        return None
+    return REASON_CODE_TEXTS.get(key, key)
+
 def task_to_response(task: RegistrationTask, db=None) -> RegistrationTaskResponse:
     """转换任务模型为响应"""
     email_service, email_service_name = _resolve_task_email_service(task, db=db)
     email = _resolve_task_email(task)
+    result = task.result if isinstance(task.result, dict) else {}
+    metadata = result.get("metadata") if isinstance(result, dict) else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
 
     return RegistrationTaskResponse(
         id=task.id,
@@ -399,12 +462,15 @@ def task_to_response(task: RegistrationTask, db=None) -> RegistrationTaskRespons
         email_service=email_service,
         email_service_name=email_service_name,
         email=email,
+        email_service_selected_domain=str(metadata.get("email_service_selected_domain") or "").strip() or None,
+        email_service_runtime_metrics=metadata.get("email_service_runtime_metrics") if isinstance(metadata.get("email_service_runtime_metrics"), dict) else None,
         proxy=task.proxy,
         logs=task.logs,
-        result=task.result,
+        result=result or task.result,
         error_message=task.error_message,
         phase=getattr(task, "phase", None),
         reason_code=getattr(task, "reason_code", None),
+        reason_text=_get_reason_text(getattr(task, "reason_code", None)),
         defer_bucket=getattr(task, "defer_bucket", None),
         retry_count=getattr(task, "retry_count", None),
         next_retry_at=task.next_retry_at.isoformat() if getattr(task, "next_retry_at", None) else None,
@@ -424,6 +490,11 @@ SERVICE_DISPLAY_NAMES = {
     "freemail": "Freemail",
     "imap_mail": "IMAP 邮箱",
     "cloud_mail": "CloudMail",
+}
+
+HARD_INVALID_MAILBOX_REASON_CODES = {
+    "registration_disallowed",
+    "mailbox_invalid_domain",
 }
 
 
@@ -471,6 +542,46 @@ def _resolve_task_email(task: RegistrationTask) -> Optional[str]:
     return None
 
 
+def _record_mailbox_governance_state(
+    *,
+    task_uuid: str,
+    email_service_type: str,
+    result: RegistrationResult,
+    next_state: str,
+    next_retry_at: Optional[datetime] = None,
+) -> None:
+    email = str(getattr(result, "email", "") or "").strip().lower()
+    if not email:
+        return
+
+    service_id = email
+    reason_code = str(getattr(result, "reason_code", "") or "").strip() or None
+
+    try:
+        if next_state == "deferred_hold":
+            MailboxRegistry.mark_deferred(
+                email=email,
+                service_type=email_service_type,
+                service_id=service_id,
+                task_uuid=task_uuid,
+                reason_code=reason_code,
+                next_retry_at=next_retry_at.isoformat() if next_retry_at else None,
+            )
+            return
+
+        if next_state == "failed":
+            MailboxRegistry.mark_failed(
+                email=email,
+                service_type=email_service_type,
+                service_id=service_id,
+                task_uuid=task_uuid,
+                reason_code=reason_code,
+                hard_invalid=bool(reason_code in HARD_INVALID_MAILBOX_REASON_CODES),
+            )
+    except Exception as exc:
+        logger.warning("邮箱治理状态写入失败: task=%s email=%s error=%s", task_uuid, email, exc)
+
+
 def _normalize_email_service_config(
     service_type: EmailServiceType,
     config: Optional[dict],
@@ -503,10 +614,44 @@ def _make_task_execution_outcome(outcome: str, error: str = "", email: str = "")
     }
 
 
+def _finalize_cancelled_task(
+    db,
+    task_uuid: str,
+    *,
+    default_reason: str = "用户手动取消任务",
+    task=None,
+):
+    """统一任务取消收尾，保留首个已写入的取消原因。"""
+    current_task = task or crud.get_registration_task_by_uuid(db, task_uuid)
+    final_reason = str(default_reason or "").strip() or "用户手动取消任务"
+    completed_at = datetime.utcnow()
+
+    if current_task:
+        existing_reason = str(getattr(current_task, "error_message", "") or "").strip()
+        if existing_reason:
+            final_reason = existing_reason
+        existing_completed_at = getattr(current_task, "completed_at", None)
+        if existing_completed_at:
+            completed_at = existing_completed_at
+
+    updated_task = crud.update_registration_task(
+        db,
+        task_uuid,
+        status="cancelled",
+        completed_at=completed_at,
+        error_message=final_reason,
+    )
+    task_manager.update_status(task_uuid, "cancelled", error=final_reason)
+    return updated_task, final_reason
+
+
 def _gate_task_execution_by_retry_window(task_uuid: str):
     with get_db() as db:
         task = crud.get_registration_task_by_uuid(db, task_uuid)
         if not task:
+            return True, None
+        task_status = str(getattr(task, "status", "") or "").strip().lower()
+        if task_status != "deferred":
             return True, None
         if not should_run_deferred_task(task, now=datetime.utcnow()):
             next_retry_at = getattr(task, "next_retry_at", None)
@@ -545,6 +690,12 @@ def _apply_retry_policy_for_failed_task(
     )
 
     if action.mark_dead:
+        _record_mailbox_governance_state(
+            task_uuid=task_uuid,
+            email_service_type=email_service_type,
+            result=result,
+            next_state="failed",
+        )
         crud.update_registration_task_retry_state(
             db,
             task_uuid,
@@ -553,11 +704,24 @@ def _apply_retry_policy_for_failed_task(
             retry_count=retry_count + 1,
             phase=phase,
         )
+        crud.update_registration_task(
+            db,
+            task_uuid,
+            result=result.to_dict(),
+            error_message=result.error_message,
+        )
         task_manager.update_status(task_uuid, "failed", error=result.error_message)
         logger.warning(f"注册任务失败: {task_uuid}, 原因: {result.error_message}")
         return _make_task_execution_outcome("failed", error=result.error_message)
 
     if action.should_defer:
+        _record_mailbox_governance_state(
+            task_uuid=task_uuid,
+            email_service_type=email_service_type,
+            result=result,
+            next_state="deferred_hold",
+            next_retry_at=action.next_retry_at,
+        )
         crud.update_registration_task_retry_state(
             db,
             task_uuid,
@@ -571,6 +735,12 @@ def _apply_retry_policy_for_failed_task(
                 int(getattr(task, "context_version", 0) or 0)
                 + (1 if (action.should_rotate_email_context or action.should_rotate_identity_context or action.should_rotate_proxy_context) else 0)
             ),
+        )
+        crud.update_registration_task(
+            db,
+            task_uuid,
+            result=result.to_dict(),
+            error_message=result.error_message,
         )
         task_manager.update_status(
             task_uuid,
@@ -590,6 +760,12 @@ def _apply_retry_policy_for_failed_task(
         )
         return _make_task_execution_outcome("deferred", error=result.error_message)
 
+    _record_mailbox_governance_state(
+        task_uuid=task_uuid,
+        email_service_type=email_service_type,
+        result=result,
+        next_state="failed",
+    )
     crud.update_registration_task_retry_state(
         db,
         task_uuid,
@@ -609,6 +785,7 @@ def _resolve_batch_wait_reason_code(reason: str, defer_code: str) -> str:
         "otp_wait_timeout": "email_otp_timeout",
         "token_acquisition_rate_limited": "unknown_retryable",
         "token_acquisition_dirty_window": "oauth_callback_miss",
+        "token_acquisition_password_pending": "token_password_pending",
         "exploratory_domain_register_retryable": "unknown_retryable",
     }
     if code in mapped_codes:
@@ -644,22 +821,38 @@ def _apply_batch_wait_deferred_task_state(
     defer_bucket = action.defer_bucket or "deferred_short"
     resume_phase = action.resume_phase or phase or getattr(task, "phase", None)
 
+    batch_wait_result = RegistrationResult(
+        success=False,
+        email=_resolve_task_email(task) or "",
+        error_message=reason,
+        phase=phase,
+        reason_code=reason_code,
+    )
+    _record_mailbox_governance_state(
+        task_uuid=task_uuid,
+        email_service_type=email_service_type,
+        result=batch_wait_result,
+        next_state="deferred_hold",
+        next_retry_at=next_retry_at,
+    )
+
     crud.update_registration_task_retry_state(
         db,
         task_uuid,
         status="deferred",
         reason_code=reason_code,
-        defer_bucket=defer_bucket,
-        retry_count=retry_count + 1,
-        next_retry_at=next_retry_at,
-        phase=resume_phase,
-        context_version=int(getattr(task, "context_version", 0) or 0),
-    )
+            defer_bucket=defer_bucket,
+            retry_count=retry_count + 1,
+            next_retry_at=next_retry_at,
+            phase=resume_phase,
+            context_version=int(getattr(task, "context_version", 0) or 0),
+        )
     crud.update_registration_task(
         db,
         task_uuid,
         started_at=None,
         completed_at=None,
+        result=batch_wait_result.to_dict(),
         error_message=reason,
     )
     task_manager.update_status(
@@ -685,6 +878,8 @@ def _classify_proxy_report_reason(error_text: str, outcome: str) -> str:
     outcome_key = str(outcome or "").strip().lower()
     if outcome_key == "completed":
         return "success"
+    if "failed to create account. please try again." in text:
+        return "register_create_account_retryable"
     if "http 429" in text or "rate limit exceeded" in text or "too many requests" in text:
         return "http_429"
     if "token exchange failed" in text:
@@ -704,12 +899,17 @@ def _report_dynamic_proxy_result_if_needed(
     proxy_url: Optional[str],
     task_uuid: str,
     outcome: str,
+    phase: str = "",
     error_message: str = "",
 ) -> None:
-    if not dynamic_proxy_used:
-        return
     runtime_proxy = str(proxy_url or "").strip()
     if not runtime_proxy:
+        return
+
+    normalized_phase = str(phase or "").strip().lower()
+    normalized_error = str(error_message or "").strip().lower()
+    if normalized_phase in {"", "init"} and normalized_error.startswith("创建邮箱失败"):
+        logger.info("任务 %s 在邮箱创建阶段失败，跳过代理结果上报: %s", task_uuid, runtime_proxy)
         return
 
     try:
@@ -717,8 +917,6 @@ def _report_dynamic_proxy_result_if_needed(
 
         settings = get_settings()
         report_url = str(getattr(settings, "proxy_dynamic_report_url", "") or "").strip()
-        if not report_url:
-            return
 
         api_key = settings.proxy_dynamic_api_key.get_secret_value() if settings.proxy_dynamic_api_key else ""
         reason = _classify_proxy_report_reason(error_message, outcome)
@@ -749,14 +947,12 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
             # 检查是否已取消
             if task_manager.is_cancelled(task_uuid):
                 logger.info(f"任务 {task_uuid} 已取消，跳过执行")
-                crud.update_registration_task(
-                    db, task_uuid,
-                    status="cancelled",
-                    completed_at=datetime.utcnow(),
-                    error_message="任务已取消",
+                _, reason = _finalize_cancelled_task(
+                    db,
+                    task_uuid,
+                    default_reason="用户手动取消任务",
                 )
-                task_manager.update_status(task_uuid, "cancelled", error="任务已取消")
-                return _make_task_execution_outcome("cancelled", error="任务已取消")
+                return _make_task_execution_outcome("cancelled", error=reason)
 
             # 更新任务状态为运行中
             task = crud.update_registration_task(
@@ -903,6 +1099,20 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         logger.info(f"使用数据库 Freemail 服务: {db_service.name}")
                     else:
                         raise ValueError("没有可用的 Freemail 邮箱服务，请先在邮箱服务页面添加服务")
+                elif service_type in (EmailServiceType.CLOUD_MAIL, EmailServiceType.CLOUDMAIL):
+                    from ...database.models import EmailService as EmailServiceModel
+
+                    db_service = db.query(EmailServiceModel).filter(
+                        EmailServiceModel.service_type == "cloud_mail",
+                        EmailServiceModel.enabled == True
+                    ).order_by(EmailServiceModel.priority.asc()).first()
+
+                    if db_service and db_service.config:
+                        config = _normalize_email_service_config(service_type, db_service.config)
+                        crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
+                        logger.info(f"使用数据库 CloudMail 服务: {db_service.name}")
+                    else:
+                        raise ValueError("没有可用的 CloudMail 邮箱服务，请先在邮箱服务页面添加服务")
                 elif service_type == EmailServiceType.IMAP_MAIL:
                     from ...database.models import EmailService as EmailServiceModel
 
@@ -933,6 +1143,12 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 batch_wait_slice_seconds=batch_wait_slice_seconds,
                 check_cancelled=task_manager.create_check_cancelled_callback(task_uuid),
             )
+            existing_result = task.result if isinstance(task.result, dict) else {}
+            if existing_result:
+                try:
+                    engine.restore_deferred_context(existing_result)
+                except Exception as restore_exc:
+                    logger.warning("恢复任务上下文失败: task=%s error=%s", task_uuid, restore_exc)
 
             # 执行注册
             role_tag = normalize_role_tag(registration_type)
@@ -940,14 +1156,11 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
             result = engine.run()
 
             if task_manager.is_cancelled(task_uuid) and not result.success:
-                reason = "任务已取消"
-                crud.update_registration_task(
-                    db, task_uuid,
-                    status="cancelled",
-                    completed_at=datetime.utcnow(),
-                    error_message=reason,
+                _, reason = _finalize_cancelled_task(
+                    db,
+                    task_uuid,
+                    default_reason="用户手动取消任务",
                 )
-                task_manager.update_status(task_uuid, "cancelled", error=reason)
                 logger.info(f"任务 {task_uuid} 在执行后检测到取消请求，按取消收尾")
                 return _make_task_execution_outcome("cancelled", error=reason)
 
@@ -1063,6 +1276,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     proxy_url=openai_proxy_url,
                     task_uuid=task_uuid,
                     outcome="completed",
+                    phase=str(getattr(result, "phase", "") or ""),
                     error_message="",
                 )
 
@@ -1083,14 +1297,11 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
             else:
                 # 更新任务状态为失败
                 if task_manager.is_cancelled(task_uuid):
-                    reason = "任务已取消"
-                    crud.update_registration_task(
-                        db, task_uuid,
-                        status="cancelled",
-                        completed_at=datetime.utcnow(),
-                        error_message=reason
+                    _, reason = _finalize_cancelled_task(
+                        db,
+                        task_uuid,
+                        default_reason="用户手动取消任务",
                     )
-                    task_manager.update_status(task_uuid, "cancelled", error=reason)
                     logger.info(f"注册任务取消收尾: {task_uuid}")
                     return _make_task_execution_outcome("cancelled", error=reason)
 
@@ -1105,6 +1316,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     proxy_url=openai_proxy_url,
                     task_uuid=task_uuid,
                     outcome=outcome.get("outcome", "failed"),
+                    phase=str(getattr(result, "phase", "") or ""),
                     error_message=result.error_message,
                 )
                 return outcome
@@ -1146,6 +1358,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         proxy_url=openai_proxy_url,
                         task_uuid=task_uuid,
                         outcome=outcome.get("outcome", "failed"),
+                        phase=str(getattr(failure_result, "phase", "") or ""),
                         error_message=str(e),
                     )
                     return outcome
@@ -1609,15 +1822,15 @@ async def start_batch_registration(
     """
     启动批量注册任务
 
-    - count: 注册数量 (正整数，当前上限 1000)
+    - count: 注册数量（正整数）
     - email_service_type: 邮箱服务类型
     - proxy: 代理地址
     - interval_min: 最小间隔秒数
     - interval_max: 最大间隔秒数
     """
     # 验证参数
-    if request.count < 1 or request.count > 1000:
-        raise HTTPException(status_code=400, detail="注册数量必须在 1-1000 之间")
+    if request.count < 1:
+        raise HTTPException(status_code=400, detail="注册数量必须是正整数")
     try:
         EmailServiceType(request.email_service_type)
     except ValueError:
@@ -1772,6 +1985,12 @@ async def get_task_logs(task_uuid: str):
             "email": email or _resolve_task_email(task),
             "email_service": service_type or email_service,
             "email_service_name": email_service_name,
+            "email_service_selected_domain": str((result.get("metadata") or {}).get("email_service_selected_domain") or "").strip() or None,
+            "email_service_runtime_metrics": (
+                (result.get("metadata") or {}).get("email_service_runtime_metrics")
+                if isinstance((result.get("metadata") or {}).get("email_service_runtime_metrics"), dict)
+                else None
+            ),
             "logs": logs.split("\n") if logs else []
         }
 
@@ -1789,12 +2008,11 @@ async def cancel_task(task_uuid: str):
 
         task_manager.cancel_task(task_uuid)
         task_manager.update_status(task_uuid, "cancelling", error="用户手动取消任务")
-        task = crud.update_registration_task(
+        task, _ = _finalize_cancelled_task(
             db,
             task_uuid,
-            status="cancelled",
-            completed_at=datetime.utcnow(),
-            error_message="用户手动取消任务",
+            default_reason="用户手动取消任务",
+            task=task,
         )
 
         return {"success": True, "message": "任务已取消"}
@@ -1819,6 +2037,10 @@ async def delete_task(task_uuid: str):
 @router.get("/stats")
 async def get_registration_stats():
     """获取注册统计信息"""
+    cached = _get_cached_registration_stats()
+    if cached is not None:
+        return cached
+
     with get_db() as db:
         from sqlalchemy import func
 
@@ -1844,7 +2066,7 @@ async def get_registration_stats():
         today_total = today_success + today_failed
         today_success_rate = round((today_success / today_total) * 100, 1) if today_total > 0 else 0.0
 
-        return {
+        payload = {
             "by_status": {status: count for status, count in status_stats},
             "today_count": today_total,
             "today_total": today_total,
@@ -1853,6 +2075,8 @@ async def get_registration_stats():
             "today_success_rate": today_success_rate,
             "today_by_status": today_by_status,
         }
+        _set_cached_registration_stats(payload)
+        return payload
 
 
 @router.get("/available-services")

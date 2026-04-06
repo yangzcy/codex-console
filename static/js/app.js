@@ -20,6 +20,10 @@ let taskFinalStatus = null;  // 保存任务的最终状态
 let batchFinalStatus = null;  // 保存批量任务的最终状态
 let displayedLogs = new Set();  // 用于日志去重
 let toastShown = false;  // 标记是否已显示过 toast
+let suppressTaskPollingResume = false;
+let isLoadingRecentAccounts = false;
+let isLoadingTodayStats = false;
+let lastDashboardInteractionAt = Date.now();
 let availableServices = {
     tempmail: { available: true, services: [] },
     outlook: { available: false, services: [] },
@@ -38,6 +42,10 @@ let wsHeartbeatInterval = null;  // 心跳定时器
 let batchWsHeartbeatInterval = null;  // 批量任务心跳定时器
 let activeTaskUuid = null;   // 当前活跃的单任务 UUID（用于页面重新可见时重连）
 let activeBatchId = null;    // 当前活跃的批量任务 ID（用于页面重新可见时重连）
+const DASHBOARD_ACTIVE_POLL_MS = 30000;
+const DASHBOARD_IDLE_POLL_MS = 120000;
+const DASHBOARD_IDLE_THRESHOLD_MS = 90000;
+const DASHBOARD_POLL_JITTER_MS = 5000;
 
 function getBatchTaskLabel() {
     return isOutlookBatchMode ? 'Outlook 批量任务' : '批量任务';
@@ -65,10 +73,58 @@ function getSingleCompletionMessage(status) {
     if (status === 'completed') {
         return `[成功] 注册成功！邮箱服务: ${serviceLabel}`;
     }
+    if (status === 'deferred') {
+        return `[等待] 任务已转入延后重试，邮箱服务: ${serviceLabel}`;
+    }
     if (status === 'failed') {
         return `[错误] 注册失败，邮箱服务: ${serviceLabel}`;
     }
     return `[警告] 任务已取消，邮箱服务: ${serviceLabel}`;
+}
+
+function getSingleFailureReason(data = null) {
+    return (
+        data?.error
+        || data?.error_message
+        || currentTask?.error_message
+        || '未知原因'
+    );
+}
+
+function getRegistrationReasonText(reasonCode) {
+    const mapping = {
+        email_otp_timeout: '邮箱验证码超时',
+        oauth_callback_miss: 'OAuth 回调未命中',
+        token_password_pending: '账号已确认进入登录链路，密码暂未生效',
+        token_password_unconfirmed: '账号状态未确认，登录密码当前被拒绝',
+        primaryapi_server_error: '上游服务异常',
+        registration_disallowed: '当前邮箱域名被注册策略拒绝',
+        network_timeout: '网络超时',
+        proxy_pool_exhausted: '代理池耗尽',
+        unknown_retryable: '可重试异常',
+    };
+    const key = String(reasonCode || '').trim();
+    return mapping[key] || key || '未知原因';
+}
+
+function buildDeferredReasonMessage(data = null) {
+    const reasonCode = data?.reason_code || currentTask?.reason_code || '';
+    const reasonText = data?.reason_text || currentTask?.reason_text || getRegistrationReasonText(reasonCode);
+    const nextRetryAt = data?.next_retry_at || currentTask?.next_retry_at || '';
+    const detail = getSingleFailureReason(data);
+    const parts = [];
+
+    if (reasonText) {
+        parts.push(`原因类别: ${reasonText}`);
+    }
+    if (nextRetryAt) {
+        parts.push(`下次重试: ${format.date(nextRetryAt)}`);
+    }
+    if (detail) {
+        parts.push(`详情: ${detail}`);
+    }
+
+    return parts.join('，');
 }
 
 function getCurrentBatchServiceLabel() {
@@ -143,6 +199,36 @@ function getSelectedServiceLabel() {
     return option ? option.textContent.trim() : '';
 }
 
+function isDocumentVisible() {
+    return document.visibilityState === 'visible';
+}
+
+function markDashboardInteraction() {
+    lastDashboardInteractionAt = Date.now();
+}
+
+function isDashboardRecentlyActive() {
+    return (Date.now() - lastDashboardInteractionAt) < DASHBOARD_IDLE_THRESHOLD_MS;
+}
+
+function getDashboardPollIntervalMs() {
+    return isDocumentVisible() && isDashboardRecentlyActive()
+        ? DASHBOARD_ACTIVE_POLL_MS
+        : DASHBOARD_IDLE_POLL_MS;
+}
+
+function getDashboardPollDelayMs() {
+    const base = getDashboardPollIntervalMs();
+    const jitter = Math.floor(Math.random() * (DASHBOARD_POLL_JITTER_MS * 2 + 1)) - DASHBOARD_POLL_JITTER_MS;
+    return Math.max(5000, base + jitter);
+}
+
+function initDashboardActivityTracking() {
+    ['pointerdown', 'keydown', 'focus'].forEach(eventName => {
+        window.addEventListener(eventName, markDashboardInteraction, { passive: true });
+    });
+}
+
 function inferCurrentEmailServiceType(task = null) {
     if (task?.email_service_name) {
         return task.email_service_name;
@@ -179,6 +265,55 @@ function updateTaskServiceLabel(task = null) {
         : '-';
 }
 
+function getTaskRuntimeMetrics(task = null) {
+    if (task?.email_service_runtime_metrics && typeof task.email_service_runtime_metrics === 'object') {
+        return task.email_service_runtime_metrics;
+    }
+    if (task?.result?.metadata?.email_service_runtime_metrics && typeof task.result.metadata.email_service_runtime_metrics === 'object') {
+        return task.result.metadata.email_service_runtime_metrics;
+    }
+    return {};
+}
+
+function updateTaskDiagnostics(task = null) {
+    const metrics = getTaskRuntimeMetrics(task);
+    const reasonCodeText = task?.reason_text
+        || task?.result?.reason_text
+        || getRegistrationReasonText(task?.reason_code || task?.result?.reason_code || '');
+    const nextRetryAtRaw = task?.next_retry_at || task?.result?.next_retry_at || '';
+    const nextRetryAt = nextRetryAtRaw ? format.date(nextRetryAtRaw) : '-';
+    const selectedDomain = task?.email_service_selected_domain
+        || task?.result?.metadata?.email_service_selected_domain
+        || metrics.selected_domain
+        || '-';
+    const createEmailStatus = metrics.create_email_status || '-';
+    const otpFetchStatus = metrics.otp_fetch_status || '-';
+    const otpPollCount = Number.isFinite(metrics.otp_poll_count) ? String(metrics.otp_poll_count) : '-';
+    const mailListSize = Number.isFinite(metrics.mail_list_size) ? String(metrics.mail_list_size) : '-';
+    const selectedMailId = metrics.selected_mail_id || '-';
+
+    const hasDiagnostic = [
+        reasonCodeText,
+        nextRetryAt,
+        selectedDomain,
+        createEmailStatus,
+        otpFetchStatus,
+        otpPollCount,
+        mailListSize,
+        selectedMailId,
+    ].some(value => value && value !== '-');
+
+    elements.taskReasonCode.textContent = reasonCodeText || '-';
+    elements.taskNextRetryAt.textContent = nextRetryAt;
+    elements.taskSelectedDomain.textContent = selectedDomain;
+    elements.taskCreateEmailStatus.textContent = createEmailStatus;
+    elements.taskOtpFetchStatus.textContent = otpFetchStatus;
+    elements.taskOtpPollCount.textContent = otpPollCount;
+    elements.taskMailListSize.textContent = mailListSize;
+    elements.taskSelectedMailId.textContent = selectedMailId;
+    elements.taskDiagnosticPanel.style.display = hasDiagnostic ? 'grid' : 'none';
+}
+
 // DOM 元素
 const elements = {
     form: document.getElementById('registration-form'),
@@ -193,6 +328,7 @@ const elements = {
     startBtn: document.getElementById('start-btn'),
     cancelBtn: document.getElementById('cancel-btn'),
     taskStatusRow: document.getElementById('task-status-row'),
+    taskDiagnosticPanel: document.getElementById('task-diagnostic-panel'),
     batchProgressSection: document.getElementById('batch-progress-section'),
     consoleLog: document.getElementById('console-log'),
     clearLogBtn: document.getElementById('clear-log-btn'),
@@ -202,6 +338,14 @@ const elements = {
     taskStatus: document.getElementById('task-status'),
     taskService: document.getElementById('task-service'),
     taskStatusBadge: document.getElementById('task-status-badge'),
+    taskReasonCode: document.getElementById('task-reason-code'),
+    taskNextRetryAt: document.getElementById('task-next-retry-at'),
+    taskSelectedDomain: document.getElementById('task-selected-domain'),
+    taskCreateEmailStatus: document.getElementById('task-create-email-status'),
+    taskOtpFetchStatus: document.getElementById('task-otp-fetch-status'),
+    taskOtpPollCount: document.getElementById('task-otp-poll-count'),
+    taskMailListSize: document.getElementById('task-mail-list-size'),
+    taskSelectedMailId: document.getElementById('task-selected-mail-id'),
     // 批量状态
     batchProgressText: document.getElementById('batch-progress-text'),
     batchProgressPercent: document.getElementById('batch-progress-percent'),
@@ -247,6 +391,7 @@ const elements = {
 
 // 初始化
 document.addEventListener('DOMContentLoaded', () => {
+    initDashboardActivityTracking();
     initEventListeners();
     loadAvailableServices();
     loadRecentAccounts();
@@ -687,6 +832,7 @@ async function handleSingleRegistration(requestData) {
     // 重置任务状态
     taskCompleted = false;
     taskFinalStatus = null;
+    suppressTaskPollingResume = false;
     displayedLogs.clear();  // 清空日志去重集合
     toastShown = false;  // 重置 toast 标志
 
@@ -718,23 +864,29 @@ async function handleSingleRegistration(requestData) {
     }
 }
 
-async function refreshTaskSummary(taskUuid) {
+async function refreshTaskSummary(taskUuid, options = {}) {
+    const { persistCurrentTask = true } = options;
     if (!taskUuid) {
         return;
     }
 
     try {
         const data = await api.get(`/registration/tasks/${taskUuid}`);
-        currentTask = {
-            ...(currentTask || {}),
+        const mergedTask = {
+            ...((persistCurrentTask ? currentTask : null) || {}),
             ...data,
             email_service: data?.email_service || currentTask?.email_service,
             email_service_name: data?.email_service_name || currentTask?.email_service_name
         };
+        if (persistCurrentTask) {
+            currentTask = mergedTask;
+        }
         if (data?.email) {
             elements.taskEmail.textContent = data.email;
         }
-        updateTaskServiceLabel(currentTask);
+        updateTaskServiceLabel(mergedTask);
+        updateTaskDiagnostics(mergedTask);
+        return mergedTask;
     } catch (error) {
         console.error('刷新任务摘要失败:', error);
     }
@@ -747,6 +899,7 @@ async function refreshTaskSummary(taskUuid) {
 function connectWebSocket(taskUuid) {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/api/ws/task/${taskUuid}`;
+    suppressTaskPollingResume = false;
 
     try {
         webSocket = new WebSocket(wsUrl);
@@ -774,13 +927,15 @@ function connectWebSocket(taskUuid) {
                 if (data.email_service) {
                     elements.taskService.textContent = getServiceTypeText(data.email_service);
                 }
+                updateTaskDiagnostics({ ...(currentTask || {}), ...data });
 
                 // 检查是否完成
-                if (['completed', 'failed', 'cancelled', 'cancelling'].includes(data.status)) {
+                if (['completed', 'failed', 'cancelled', 'cancelling', 'deferred'].includes(data.status)) {
                     // 保存最终状态，用于 onclose 判断
                     taskFinalStatus = data.status;
                     taskCompleted = true;
-                    refreshTaskSummary(currentTask?.task_uuid || taskUuid);
+                    suppressTaskPollingResume = true;
+                    refreshTaskSummary(currentTask?.task_uuid || taskUuid, { persistCurrentTask: false });
 
                     // 断开 WebSocket（异步操作）
                     disconnectWebSocket();
@@ -797,8 +952,13 @@ function connectWebSocket(taskUuid) {
                             // 刷新账号列表
                             loadRecentAccounts();
                         } else if (data.status === 'failed') {
-                            addLog('error', getSingleCompletionMessage('failed'));
-                            toast.error(`注册失败，邮箱服务: ${getCurrentSingleServiceLabel()}`);
+                            const reason = getSingleFailureReason(data);
+                            addLog('error', `${getSingleCompletionMessage('failed')}，原因: ${reason}`);
+                            toast.error(`注册失败，邮箱服务: ${getCurrentSingleServiceLabel()}，原因: ${reason}`);
+                        } else if (data.status === 'deferred') {
+                            const reason = buildDeferredReasonMessage(data);
+                            addLog('warning', `${getSingleCompletionMessage('deferred')}，${reason}`);
+                            toast.warning(`任务已进入延后重试，${reason}`);
                         } else if (data.status === 'cancelled' || data.status === 'cancelling') {
                             addLog('warning', getSingleCompletionMessage('cancelled'));
                         }
@@ -816,7 +976,8 @@ function connectWebSocket(taskUuid) {
             // 只有在任务未完成且最终状态不是完成状态时才切换到轮询
             // 使用 taskFinalStatus 而不是 currentTask.status，因为 currentTask 可能已被重置
             const shouldPoll = !taskCompleted &&
-                               taskFinalStatus === null;  // 如果 taskFinalStatus 有值，说明任务已完成
+                               taskFinalStatus === null &&
+                               !suppressTaskPollingResume;  // 终态主动断开时不应回退到轮询
 
             if (shouldPoll && currentTask) {
                 console.log('切换到轮询模式');
@@ -991,9 +1152,14 @@ async function handleCancelTask() {
 
 // 开始轮询日志
 function startLogPolling(taskUuid) {
+    stopLogPolling();
+    suppressTaskPollingResume = false;
     let lastLogIndex = 0;
 
     logPollingInterval = setInterval(async () => {
+        if (!isDocumentVisible()) {
+            return;
+        }
         try {
             const data = await api.get(`/registration/tasks/${taskUuid}/logs`);
 
@@ -1005,6 +1171,7 @@ function startLogPolling(taskUuid) {
                 elements.taskEmail.textContent = data.email;
             }
             updateTaskServiceLabel(data);
+            updateTaskDiagnostics(data);
 
             // 添加新日志
             const logs = data.logs || [];
@@ -1016,9 +1183,10 @@ function startLogPolling(taskUuid) {
             lastLogIndex = logs.length;
 
             // 检查任务是否完成
-            if (['completed', 'failed', 'cancelled'].includes(data.status)) {
+            if (['completed', 'failed', 'cancelled', 'deferred'].includes(data.status)) {
                 stopLogPolling();
-                refreshTaskSummary(taskUuid);
+                suppressTaskPollingResume = true;
+                refreshTaskSummary(taskUuid, { persistCurrentTask: false });
                 resetButtons();
 
                 // 只显示一次 toast
@@ -1030,8 +1198,13 @@ function startLogPolling(taskUuid) {
                         // 刷新账号列表
                         loadRecentAccounts();
                     } else if (data.status === 'failed') {
-                        addLog('error', getSingleCompletionMessage('failed'));
-                        toast.error(`注册失败，邮箱服务: ${getCurrentSingleServiceLabel()}`);
+                        const reason = getSingleFailureReason(data);
+                        addLog('error', `${getSingleCompletionMessage('failed')}，原因: ${reason}`);
+                        toast.error(`注册失败，邮箱服务: ${getCurrentSingleServiceLabel()}，原因: ${reason}`);
+                    } else if (data.status === 'deferred') {
+                        const reason = buildDeferredReasonMessage(data);
+                        addLog('warning', `${getSingleCompletionMessage('deferred')}，${reason}`);
+                        toast.warning(`任务已进入延后重试，${reason}`);
                     } else if (data.status === 'cancelled') {
                         addLog('warning', getSingleCompletionMessage('cancelled'));
                     }
@@ -1053,7 +1226,11 @@ function stopLogPolling() {
 
 // 开始轮询批量状态
 function startBatchPolling(batchId) {
+    stopBatchPolling();
     batchPollingInterval = setInterval(async () => {
+        if (!isDocumentVisible()) {
+            return;
+        }
         try {
             const data = await api.get(`/registration/batch/${batchId}`);
             updateBatchProgress(data);
@@ -1091,6 +1268,7 @@ function showTaskStatus(task) {
     elements.taskId.textContent = task.task_uuid.substring(0, 8) + '...';
     elements.taskEmail.textContent = task?.email || '-';
     updateTaskServiceLabel(task);
+    updateTaskDiagnostics(task);
 }
 
 // 更新任务状态
@@ -1098,6 +1276,7 @@ function updateTaskStatus(status) {
     const statusInfo = {
         pending: { text: '等待中', class: 'pending' },
         running: { text: '运行中', class: 'running' },
+        deferred: { text: '等待重试', class: 'pending' },
         completed: { text: '已完成', class: 'completed' },
         failed: { text: '失败', class: 'failed' },
         cancelled: { text: '已取消', class: 'disabled' }
@@ -1113,6 +1292,7 @@ function updateTaskStatus(status) {
 function showBatchStatus(batch) {
     elements.batchProgressSection.style.display = 'block';
     elements.taskStatusRow.style.display = 'none';
+    elements.taskDiagnosticPanel.style.display = 'none';
     elements.taskStatusBadge.style.display = 'none';
     elements.batchProgressText.textContent = `0/${batch.count}`;
     elements.batchProgressPercent.textContent = '0%';
@@ -1155,6 +1335,11 @@ function updateBatchProgress(data) {
 
 // 加载最近注册的账号
 async function loadRecentAccounts() {
+    if (isLoadingRecentAccounts) {
+        return;
+    }
+
+    isLoadingRecentAccounts = true;
     try {
         const data = await api.get('/accounts?page=1&page_size=10');
 
@@ -1205,15 +1390,68 @@ async function loadRecentAccounts() {
 
     } catch (error) {
         console.error('加载账号列表失败:', error);
+    } finally {
+        isLoadingRecentAccounts = false;
     }
 }
 
 // 开始账号列表轮询
 function startAccountsPolling() {
-    // 每30秒刷新一次账号列表
-    accountsPollingInterval = setInterval(() => {
-        loadRecentAccounts();
-    }, 30000);
+    if (accountsPollingInterval) {
+        clearTimeout(accountsPollingInterval);
+    }
+
+    const poll = () => {
+        accountsPollingInterval = setTimeout(() => {
+            if (isDocumentVisible()) {
+                loadRecentAccounts();
+            }
+            poll();
+        }, getDashboardPollDelayMs());
+    };
+
+    poll();
+}
+
+function stopAccountsPolling() {
+    if (accountsPollingInterval) {
+        clearTimeout(accountsPollingInterval);
+        accountsPollingInterval = null;
+    }
+}
+
+function startTodayStatsPolling() {
+    if (todayStatsPollingInterval) {
+        clearTimeout(todayStatsPollingInterval);
+    }
+
+    const poll = () => {
+        todayStatsPollingInterval = setTimeout(() => {
+            if (isDocumentVisible()) {
+                loadTodayStats(true);
+            }
+            poll();
+        }, getDashboardPollDelayMs());
+    };
+
+    poll();
+}
+
+function stopTodayStatsPolling() {
+    if (todayStatsPollingInterval) {
+        clearTimeout(todayStatsPollingInterval);
+        todayStatsPollingInterval = null;
+    }
+}
+
+function refreshDashboardPollingCadence() {
+    if (!isDocumentVisible()) {
+        return;
+    }
+    stopAccountsPolling();
+    stopTodayStatsPolling();
+    startAccountsPolling();
+    startTodayStatsPolling();
 }
 
 function renderTodayStats(total, success, failed, rate) {
@@ -1248,6 +1486,11 @@ function renderTodayStats(total, success, failed, rate) {
 }
 
 async function loadTodayStats(silent = true) {
+    if (isLoadingTodayStats) {
+        return;
+    }
+
+    isLoadingTodayStats = true;
     try {
         const data = await api.get('/registration/stats');
         const byStatus = data?.by_status || {};
@@ -1262,6 +1505,8 @@ async function loadTodayStats(silent = true) {
         if (!silent) {
             toast.error('加载今日统计失败');
         }
+    } finally {
+        isLoadingTodayStats = false;
     }
 }
 
@@ -1282,15 +1527,6 @@ function startTodayStatsResetTicker() {
         clearInterval(todayStatsResetInterval);
     }
     todayStatsResetInterval = setInterval(updateTodayStatsResetText, 60000);
-}
-
-function startTodayStatsPolling() {
-    if (todayStatsPollingInterval) {
-        clearInterval(todayStatsPollingInterval);
-    }
-    todayStatsPollingInterval = setInterval(() => {
-        loadTodayStats(true);
-    }, 60000);
 }
 
 // 添加日志
@@ -1704,7 +1940,10 @@ function startOutlookBatchPolling(batchId) {
 
 function initVisibilityReconnect() {
     document.addEventListener('visibilitychange', () => {
+        markDashboardInteraction();
         if (document.visibilityState !== 'visible') return;
+
+        refreshDashboardPollingCadence();
 
         // 页面重新可见时，检查是否需要重连（针对同页面标签切换场景）
         const wsDisconnected = !webSocket || webSocket.readyState === WebSocket.CLOSED;
@@ -1745,7 +1984,7 @@ async function restoreActiveTask() {
         // 查询任务是否仍在运行
         try {
             const data = await api.get(`/registration/tasks/${task_uuid}`);
-            if (['completed', 'failed', 'cancelled'].includes(data.status)) {
+            if (['completed', 'failed', 'cancelled', 'deferred'].includes(data.status)) {
                 sessionStorage.removeItem('activeTask');
                 return;
             }
