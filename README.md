@@ -11,6 +11,11 @@
 
 - Git 分支与发布流程: [docs/git-branch-workflow.md](docs/git-branch-workflow.md)
 
+## 排障记录
+
+- OpenAI 注册密码阶段出口验证结论（2026-04-06）: [docs/openai-register-password-stage-egress-validation-2026-04-06.md](docs/openai-register-password-stage-egress-validation-2026-04-06.md)
+  - 结论：直连与静态代理下均在密码提交阶段返回 `400`，重试后退化为 `409 invalid_state`，更像服务端风控/环境拒绝。
+
 ## QQ群
 
 - 交流群: https://qm.qq.com/q/ZTCKxawxeo
